@@ -6,5 +6,82 @@
     "early stopping hyperparameter search",
     "surrogate-assisted optimization",
     "distributed hyperparameter optimization"
+  ],
+  "research_study_list": [
+    {
+      "title": "Multi-Fidelity Bayesian Optimization via Deep Neural Networks"
+    },
+    {
+      "title": "Efficient Nonmyopic Bayesian Optimization via One-Shot Multi-Step Trees"
+    },
+    {
+      "title": "Bayesian Optimization with High-Dimensional Outputs"
+    },
+    {
+      "title": "Bayesian Optimization of Function Networks"
+    },
+    {
+      "title": "Hypervolume Knowledge Gradient: A Lookahead Approach for Multi-Objective Bayesian Optimization with Partial Information"
+    },
+    {
+      "title": "Multi-Fidelity Bayesian Optimization via Deep Neural Networks"
+    },
+    {
+      "title": "Efficient Hyperparameter Optimization with Adaptive Fidelity Identification"
+    },
+    {
+      "title": "Batch Multi-Fidelity Bayesian Optimization with  Deep Auto-Regressive Networks"
+    },
+    {
+      "title": "Supervising the Multi-Fidelity Race of Hyperparameter Configurations"
+    },
+    {
+      "title": "Supervising the Multi-Fidelity Race of Hyperparameter Configurations"
+    },
+    {
+      "title": "Bayesian Optimization for Iterative Learning"
+    },
+    {
+      "title": "Scaling Laws for Hyperparameter Optimization"
+    },
+    {
+      "title": "Hyperparameter Optimization through Neural Network Partitioning"
+    },
+    {
+      "title": "PASHA: Efficient HPO and NAS with Progressive Resource Allocation"
+    },
+    {
+      "title": "Reshuffling Resampling Splits Can Improve Generalization of Hyperparameter Optimization"
+    },
+    {
+      "title": "Black-Box Optimization with Local Generative Surrogates"
+    },
+    {
+      "title": "Incorporating Surrogate Gradient Norm to Improve Offline Optimization Techniques"
+    },
+    {
+      "title": "Landscape Surrogate: Learning Decision Losses for Mathematical Optimization Under Partial Information"
+    },
+    {
+      "title": "Continuation Path Learning for Homotopy Optimization"
+    },
+    {
+      "title": "Continuation Path Learning for Homotopy Optimization"
+    },
+    {
+      "title": "Federated Hyperparameter Tuning: Challenges, Baselines, and Connections to Weight-Sharing"
+    },
+    {
+      "title": "FedHPO-Bench: A Benchmark Suite for Federated Hyperparameter Optimization"
+    },
+    {
+      "title": "Single-shot General Hyper-parameter Optimization for Federated Learning"
+    },
+    {
+      "title": "Single-shot General Hyper-parameter Optimization for Federated Learning"
+    },
+    {
+      "title": "DP-HyPO: An Adaptive Private Framework for Hyperparameter Optimization"
+    }
   ]
 }
