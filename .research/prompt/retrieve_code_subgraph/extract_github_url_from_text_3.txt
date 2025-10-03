@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The approach models each individual function (f1,...,fK) in the network with independent Gaussian Process (GP) prior distributions. Upon evaluating the overall objective, observations of each node's output are incorporated, leading to updated posterior distributions for f1,...,fK, which remain (conditionally) independent GPs. This setup implies a generally non-Gaussian posterior distribution on the overall objective function. The acquisition function used is the Expected Improvement for Function Networks (EI-FN), computed with respect to this non-Gaussian posterior. As EI-FN does not have a closed-form expression, it is efficiently maximized using a Sample Average Approximation (SAA) approach. This involves building a Monte Carlo approximation of EI-FN using a reparametrization trick with standard normal random vectors, which is then optimized using gradient-based methods like L-BFGS-B with multiple restarts. The method's asymptotic consistency is formally proven.
+
+# GitHub URLs List
+['https://github.com/RaulAstudillo06/BOFN']
+Output:
+{
+    "index": 0
+}
