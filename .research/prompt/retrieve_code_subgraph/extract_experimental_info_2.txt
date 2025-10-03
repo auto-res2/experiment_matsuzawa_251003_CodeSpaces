@@ -1,0 +1,3394 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+The core methodology involves adapting Matheron's rule for posterior sampling in Gaussian Processes (GPs) to multi-task and high-order GPs by exploiting Kronecker structure. Matheron's rule allows for sampling from the posterior distribution by drawing joint samples from the prior over both training and test points, and then updating these samples using observed data. For Multi-task GPs (MTGPs) with Kronecker-structured covariances, the joint covariance matrix is factorized as a Kronecker product, enabling efficient root decompositions and matrix-vector multiplications that are additive in `n` and `t`. This approach is extended to High-Order Gaussian Process (HOGP) models by replacing the task kernel with a chain of Kronecker products representing tensor dimensions. For HOGP models, the paper also proposes a new set of priors for latent parameters, initializing them from a Gaussian process with a Matern2.5 kernel to encourage smoothly varying latent dimensions, leading to more smoothly varying posterior variances. The efficient posterior sampling is crucial for Monte Carlo acquisition functions used in various BO settings.
+
+# Repository Content
+File Path: contextualbo_experiments/cbo_experiment.py
+Content:
+import torch
+import argparse
+import sys
+import logging
+import time
+
+from botorch.models.contextual_multioutput import LCEMGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch import fit_gpytorch_model
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.acquisition.objective import LinearMCObjective
+from botorch.sampling import IIDNormalSampler
+from botorch.optim import optimize_acqf
+from botorch.acquisition.monte_carlo import qExpectedImprovement
+from botorch.models.transforms.outcome import Standardize
+from botorch.models.transforms.input import Normalize
+from gpytorch.likelihoods import MultitaskGaussianLikelihood, GaussianLikelihood
+from gpytorch.constraints import Interval
+from gpytorch.priors import GammaPrior
+
+from sampling_mtgps import KroneckerLCEMGP, MatheronLCEMGP
+
+sys.path.append("../../ContextualBO/benchmarks")
+from get_synthetic_problem import get_benchmark_problem
+
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output", type=str, default="results.pt")
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default="Branin2D",
+        choices=["Branin2D", "Hartmann6D", "Branin1DEmbedding", "Hartmann5DEmbedding"],
+    )
+    parser.add_argument("--n_batch", type=int, default=50)
+    parser.add_argument("--contexts", type=int, default=10)
+    parser.add_argument("--mc_samples", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--n_init", type=int, default=10)
+    return parser.parse_args()
+
+
+def optimize_acqf_and_get_candidate(acq_func, bounds, batch_size, **kwargs):
+    """Optimizes the acquisition function, and returns a new candidate and a noisy observation."""
+    # optimize
+    candidates, _ = optimize_acqf(
+        acq_function=acq_func,
+        bounds=bounds,
+        q=batch_size,
+        num_restarts=10,
+        raw_samples=256,  # used for intialization heuristic
+        options={"batch_limit": 5, "maxiter": 200, "init_batch_limit": 5},
+        **kwargs,
+    )
+    # observe new values
+    new_x = candidates.detach()
+    return new_x
+
+
+def fit_model(model):
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    # fit_gpytorch_model(mll)
+    fit_gpytorch_torch(mll, options={"maxiter": 250})
+    # [print(name, par) for name, par in model.named_parameters()]
+
+
+def construct_acqf(model, objective, num_samples, best_f):
+    sampler = IIDNormalSampler(num_samples=num_samples)
+    qEI = qExpectedImprovement(
+        model=model, best_f=best_f, sampler=sampler, objective=objective,
+    )
+    return qEI
+
+
+def main(
+    seed: int = 0,
+    device: str = "cuda",
+    output: str = "results.pt",
+    problem: str = "Branin2D",
+    n_batch: int = 50,
+    contexts: int = 10,
+    mc_samples: int = 64,
+    batch_size: int = 2,
+    n_init: int = 10,
+) -> None:
+
+    logging.basicConfig(filename=output[:-3] + ".log", level=logging.DEBUG)
+
+    torch.random.manual_seed(seed)
+
+    tkwargs = {
+        "dtype": torch.double,
+        "device": torch.device(
+            "cuda:0" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        ),
+    }
+
+    benchmark_problem = get_benchmark_problem(problem, num_contexts=contexts)
+    objective = LinearMCObjective(torch.tensor(benchmark_problem.context_weights)).to(
+        tkwargs["device"]
+    )
+
+    gen_new = lambda X: -benchmark_problem.evaluation_function_vectorized(
+        X.view(1, -1).repeat(contexts, 1).numpy()
+    )
+    gen_new_batch = lambda batch: torch.stack(
+        [torch.from_numpy(gen_new(X.cpu())) for X in batch]
+    ).to(batch)
+
+    def gen_new_for_lcem(batch):
+        reshaped_output = gen_new_batch(batch).view(-1, 1)
+        context_dims = (
+            torch.arange(contexts, **tkwargs)
+            .unsqueeze(0)
+            .repeat(batch.shape[0], 1)
+            .view(-1, 1)
+        )
+        context_stacked_batch = torch.cat(
+            (batch.repeat(1, contexts).view(-1, batch.shape[-1]), context_dims), dim=-1
+        )
+        return context_stacked_batch, reshaped_output
+
+    bounds = torch.tensor(
+        [x["bounds"] for x in benchmark_problem.base_parameters], **tkwargs
+    ).t()
+    bounds_w_taskdim = torch.cat(
+        (bounds, torch.tensor([[0.0], [contexts]], **tkwargs)), dim=-1
+    )
+
+    init_x = (bounds[1] - bounds[0]) * torch.rand(
+        n_init, bounds.shape[1], **tkwargs
+    ) + bounds[0]
+    init_y = gen_new_batch(init_x)
+
+    init_y_lcem = init_y.view(-1, 1)
+    context_dims = (
+        torch.arange(contexts, **tkwargs)
+        .unsqueeze(0)
+        .repeat(init_x.shape[0], 1)
+        .view(-1, 1)
+    )
+    init_x_lcem = torch.cat(
+        (init_x.repeat(1, contexts).view(-1, init_x.shape[-1]), context_dims), dim=-1
+    )
+
+    data_dict = {}
+    data_dict["lcem"] = [init_x_lcem, init_y_lcem]
+    data_dict["lcem_matheron"] = [init_x, init_y]
+    # data_dict["lcem_kronecker"] = [init_x, init_y]
+
+    elapsed_time = {}
+    best_achieved = {}
+    has_failed = {}
+    for key, _ in data_dict.items():
+        elapsed_time[key] = []
+        best_achieved[key] = []
+        has_failed[key] = False
+
+    for step in range(n_batch):
+        torch.cuda.empty_cache()
+
+        models_dict = {}
+        models_dict["lcem"] = LCEMGP(
+            *data_dict["lcem"],
+            task_feature=-1,
+            outcome_transform=Standardize(m=init_y_lcem.shape[-1]),
+        )
+        mt_likelihood = MultitaskGaussianLikelihood(
+            rank=0,
+            num_tasks=contexts,
+            noise_prior=GammaPrior(1.1, 0.05),
+            has_global_noise=True,
+            has_task_noise=False,
+        )
+
+        models_dict["lcem_matheron"] = MatheronLCEMGP(
+            *data_dict["lcem_matheron"],
+            outcome_transform=Standardize(m=init_y.shape[-1]),
+            likelihood=mt_likelihood,
+        )
+
+        # construct acqusition functions
+        for key, model in models_dict.items():
+            start = time.time()
+            if not has_failed[key]:
+                try:
+                    print("starting training of ", key)
+                    fit_model(model)
+                    print("finished training of ", key)
+                except Exception as e:
+                    logging.info(e)
+                    logging.info(f"{key} failed during model fitting.")
+                    has_failed[key] = True
+
+            fit_time = time.time()
+
+            best_f = best_achieved[key][-1] if step > 0 else init_y.max()
+
+            # select current context
+            current_context = torch.randint(0, contexts, torch.Size())
+            if model != "lcem":
+                weights = torch.zeros(contexts, **tkwargs)
+                weights[current_context] = 1.0
+                objective = LinearMCObjective(weights)
+                optim_kwargs = {}
+            else:
+                objective = None
+                optim_kwargs = {
+                    "fixed_feature": {init_x_lcem.shape[1]: current_context.item()}
+                }
+
+            start_acqf = time.time()
+            if not has_failed[key]:
+                try:
+                    acqf = construct_acqf(model, objective, mc_samples, best_f)
+                    new_x = optimize_acqf_and_get_candidate(
+                        acqf, bounds, batch_size, **optim_kwargs
+                    )
+                except RuntimeError as e:
+                    if "memory" in str(e):
+                        try:
+                            torch.cuda.empty_cache()
+                            acqf = construct_acqf(
+                                model, objective, int(mc_samples / 2), best_f
+                            )
+                            new_x = optimize_acqf_and_get_candidate(
+                                acqf, bounds, batch_size, **optim_kwargs
+                            )
+                        except RuntimeError as e:
+                            print(
+                                "Warning, model ",
+                                key,
+                                "has failed. Removing from operations.",
+                            )
+                            has_failed[key] = True
+
+            end = time.time()
+
+            if not has_failed[key]:
+                if key != "lcem":
+                    new_y = gen_new_batch(new_x)
+                else:
+                    new_x, new_y = gen_new_for_lcem(new_x)
+
+                curr_x, curr_y = data_dict[key]
+                data_dict[key] = [
+                    torch.cat((curr_x, new_x), dim=0),
+                    torch.cat((curr_y, new_y), dim=0),
+                ]
+                elapsed_time[key].append([end - start_acqf, fit_time - start])
+
+        if all(value for value in has_failed.values()):
+            logging.info("Ending early")
+            break
+
+        best_lcemm = objective(data_dict["lcem_matheron"][1]).max()
+        # ninds = (step + 1) * batch_size + n_init
+        # best_lcem = objective(data_dict["lcem"][1].reshape(ninds, contexts)).max()
+        if not has_failed["lcem"]:
+            ninds = (step + 1) * batch_size + n_init
+            best_lcem = objective(data_dict["lcem"][1].reshape(ninds, contexts)).max()
+            best_achieved["lcem"].append(best_lcem.cpu())
+
+        if not has_failed["lcem_matheron"]:
+            best_achieved["lcem_matheron"].append(best_lcemm.cpu())
+
+        last_times = [kk[-1] for _, kk in elapsed_time.items()]
+        logging.info(
+            f"Step: {step} Best Achieved: {best_lcem} {best_lcemm} Last Times: {last_times[0]} {last_times[1]} "
+        )
+
+    cpu_data_dict = {}
+    for key, m in data_dict.items():
+        cpu_data_dict[key] = [x.cpu().detach() for x in m]
+
+    torch.save(
+        {
+            "time": elapsed_time,
+            "data": cpu_data_dict,
+            "best": best_achieved,
+            "failed": has_failed,
+        },
+        output,
+    )
+
+
+if __name__ == "__main__":
+    args = parse()
+    main(**vars(args))
+
+File Path: contextualbo_experiments/contextual_full.py
+Content:
+import torch
+import argparse
+import sys
+import logging
+import time
+
+from botorch.models.contextual_multioutput import LCEMGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch import fit_gpytorch_model
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.acquisition.objective import LinearMCObjective
+from botorch.sampling import IIDNormalSampler
+from botorch.optim import optimize_acqf
+from botorch.acquisition.monte_carlo import qExpectedImprovement
+from botorch.models.transforms.outcome import Standardize
+from botorch.models.transforms.input import Normalize
+from gpytorch.likelihoods import MultitaskGaussianLikelihood, GaussianLikelihood
+from gpytorch.constraints import Interval
+from gpytorch.priors import GammaPrior
+
+from sampling_mtgps import KroneckerLCEMGP, MatheronLCEMGP
+
+sys.path.append("../../ContextualBO/benchmarks")
+from get_synthetic_problem import get_benchmark_problem
+
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output", type=str, default="results.pt")
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default="Branin2D",
+        choices=["Branin2D", "Hartmann6D", "Branin1DEmbedding", "Hartmann5DEmbedding"],
+    )
+    parser.add_argument("--n_batch", type=int, default=50)
+    parser.add_argument("--contexts", type=int, default=10)
+    parser.add_argument("--mc_samples", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--n_init", type=int, default=10)
+    return parser.parse_args()
+
+
+def optimize_acqf_and_get_candidate(acq_func, bounds, batch_size):
+    """Optimizes the acquisition function, and returns a new candidate and a noisy observation."""
+    # optimize
+    candidates, _ = optimize_acqf(
+        acq_function=acq_func,
+        bounds=bounds,
+        q=batch_size,
+        num_restarts=10,
+        raw_samples=512,  # used for intialization heuristic
+        options={"batch_limit": 5, "maxiter": 200, "init_batch_limit": 5},
+    )
+    # observe new values
+    new_x = candidates.detach()
+    return new_x
+
+
+def fit_model(model):
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    # fit_gpytorch_model(mll)
+    fit_gpytorch_torch(mll, options={"maxiter": 250})
+    # [print(name, par) for name, par in model.named_parameters()]
+
+
+def construct_acqf(model, objective, num_samples, best_f):
+    sampler = IIDNormalSampler(num_samples=num_samples)
+    qEI = qExpectedImprovement(
+        model=model, best_f=best_f, sampler=sampler, objective=objective,
+    )
+    return qEI
+
+
+def main(
+    seed: int = 0,
+    device: str = "cuda",
+    output: str = "results.pt",
+    problem: str = "Branin2D",
+    n_batch: int = 50,
+    contexts: int = 10,
+    mc_samples: int = 64,
+    batch_size: int = 2,
+    n_init: int = 10,
+) -> None:
+
+    logging.basicConfig(filename=output[:-3] + ".log", level=logging.DEBUG)
+
+    torch.random.manual_seed(seed)
+
+    tkwargs = {
+        "dtype": torch.double,
+        "device": torch.device(
+            "cuda:0" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        ),
+    }
+
+    benchmark_problem = get_benchmark_problem(problem, num_contexts=contexts)
+    objective = LinearMCObjective(torch.tensor(benchmark_problem.context_weights)).to(
+        tkwargs["device"]
+    )
+
+    gen_new = lambda X: -benchmark_problem.evaluation_function_vectorized(
+        X.view(1, -1).repeat(contexts, 1).numpy()
+    )
+    gen_new_batch = lambda batch: torch.stack(
+        [torch.from_numpy(gen_new(X.cpu())) for X in batch]
+    ).to(batch)
+
+    def gen_new_for_lcem(batch):
+        reshaped_output = gen_new_batch(batch).view(-1, 1)
+        context_dims = (
+            torch.arange(contexts, **tkwargs)
+            .unsqueeze(0)
+            .repeat(batch.shape[0], 1)
+            .view(-1, 1)
+        )
+        context_stacked_batch = torch.cat(
+            (batch.repeat(1, contexts).view(-1, batch.shape[-1]), context_dims), dim=-1
+        )
+        return context_stacked_batch, reshaped_output
+
+    bounds = torch.tensor(
+        [x["bounds"] for x in benchmark_problem.base_parameters], **tkwargs
+    ).t()
+    bounds_w_taskdim = torch.cat(
+        (bounds, torch.tensor([[0.0], [contexts]], **tkwargs)), dim=-1
+    )
+
+    init_x = (bounds[1] - bounds[0]) * torch.rand(
+        n_init, bounds.shape[1], **tkwargs
+    ) + bounds[0]
+    init_y = gen_new_batch(init_x)
+
+    init_y_lcem = init_y.view(-1, 1)
+    context_dims = (
+        torch.arange(contexts, **tkwargs)
+        .unsqueeze(0)
+        .repeat(init_x.shape[0], 1)
+        .view(-1, 1)
+    )
+    init_x_lcem = torch.cat(
+        (init_x.repeat(1, contexts).view(-1, init_x.shape[-1]), context_dims), dim=-1
+    )
+
+    data_dict = {}
+    data_dict["lcem"] = [init_x_lcem, init_y_lcem]
+    data_dict["lcem_matheron"] = [init_x, init_y]
+    data_dict["lcem_kronecker"] = [init_x, init_y]
+
+    elapsed_time = {}
+    best_achieved = {}
+    has_failed = {}
+    for key, _ in data_dict.items():
+        elapsed_time[key] = []
+        best_achieved[key] = []
+        has_failed[key] = False
+
+    for step in range(n_batch):
+        torch.cuda.empty_cache()
+
+        models_dict = {}
+        models_dict["lcem"] = LCEMGP(
+            *data_dict["lcem"],
+            task_feature=-1,
+            outcome_transform=Standardize(m=init_y_lcem.shape[-1]),
+            # input_transform=Normalize(d=init_x_lcem.shape[-1],bounds=bounds_w_taskdim),
+        )
+        mt_likelihood = MultitaskGaussianLikelihood(
+            rank=0,
+            num_tasks=contexts,
+            # noise_constraint=Interval(1e-7, 4.0),
+            noise_prior=GammaPrior(1.1, 0.05),
+            has_global_noise=True,
+            has_task_noise=False,
+        )
+
+        models_dict["lcem_matheron"] = MatheronLCEMGP(
+            *data_dict["lcem_matheron"],
+            outcome_transform=Standardize(m=init_y.shape[-1]),
+            # input_transform=Normalize(d=init_x.shape[-1],bounds=bounds),
+            likelihood=mt_likelihood,
+        )
+        mt_likelihood2 = MultitaskGaussianLikelihood(
+            rank=0,
+            num_tasks=contexts,
+            # noise_constraint=Interval(1e-7, 4.0),
+            noise_prior=GammaPrior(1.1, 0.05),
+            has_global_noise=True,
+            has_task_noise=False,
+        )
+        models_dict["lcem_kronecker"] = KroneckerLCEMGP(
+            *data_dict["lcem_kronecker"],
+            outcome_transform=Standardize(m=init_y.shape[-1]),
+            # input_transform=Normalize(d=init_x.shape[-1],bounds=bounds),
+            likelihood=mt_likelihood2,
+        )
+
+        # construct acqusition functions
+        for key, model in models_dict.items():
+            start = time.time()
+            if not has_failed[key]:
+                try:
+                    fit_model(model)
+                except Exception as e:
+                    logging.info(e)
+                    logging.info(f"{key} failed during model fitting.")
+                    has_failed[key] = True
+
+            fit_time = time.time()
+
+            best_f = best_achieved[key][-1] if step > 0 else init_y.max()
+
+            start_acqf = time.time()
+            if not has_failed[key]:
+                try:
+                    acqf = construct_acqf(model, objective, mc_samples, best_f)
+                    new_x = optimize_acqf_and_get_candidate(acqf, bounds, batch_size)
+                except RuntimeError as e:
+                    if "memory" in str(e):
+                        try:
+                            torch.cuda.empty_cache()
+                            acqf = construct_acqf(
+                                model, objective, int(mc_samples / 2), best_f
+                            )
+                            new_x = optimize_acqf_and_get_candidate(
+                                acqf, bounds, batch_size
+                            )
+                        except RuntimeError as e:
+                            print(
+                                "Warning, model ",
+                                key,
+                                "has failed. Removing from operations.",
+                            )
+                            has_failed[key] = True
+
+            end = time.time()
+
+            if not has_failed[key]:
+                if key != "lcem":
+                    new_y = gen_new_batch(new_x)
+                else:
+                    new_x, new_y = gen_new_for_lcem(new_x)
+
+                curr_x, curr_y = data_dict[key]
+                data_dict[key] = [
+                    torch.cat((curr_x, new_x), dim=0),
+                    torch.cat((curr_y, new_y), dim=0),
+                ]
+                elapsed_time[key].append([end - start_acqf, fit_time - start])
+
+        if all(value for value in has_failed.values()):
+            logging.info("Ending early")
+            break
+
+        best_lcemk = objective(data_dict["lcem_kronecker"][1]).max()
+        best_lcemm = objective(data_dict["lcem_matheron"][1]).max()
+        # ninds = (step + 1) * batch_size + n_init
+        # best_lcem = objective(data_dict["lcem"][1].reshape(ninds, contexts)).max()
+        if not has_failed["lcem"]:
+            ninds = (step + 1) * batch_size + n_init
+            best_lcem = objective(data_dict["lcem"][1].reshape(ninds, contexts)).max()
+            best_achieved["lcem"].append(best_lcem.cpu())
+
+        if not has_failed["lcem_matheron"]:
+            best_achieved["lcem_matheron"].append(best_lcemm.cpu())
+        if not has_failed["lcem_kronecker"]:
+            best_achieved["lcem_kronecker"].append(best_lcemk.cpu())
+
+        last_times = [kk[-1] for _, kk in elapsed_time.items()]
+        logging.info(
+            f"Step: {step} Best Achieved: {best_lcem} {best_lcemm} {best_lcemk} Last Times: {last_times[0]} {last_times[1]} {last_times[2]}"
+        )
+
+    cpu_data_dict = {}
+    for key, m in data_dict.items():
+        cpu_data_dict[key] = [x.cpu().detach() for x in m]
+
+    torch.save(
+        {
+            "time": elapsed_time,
+            "data": cpu_data_dict,
+            "best": best_achieved,
+            "failed": has_failed,
+        },
+        output,
+    )
+
+
+if __name__ == "__main__":
+    args = parse()
+    main(**vars(args))
+
+File Path: contextualbo_experiments/post_timing.py
+Content:
+import torch
+import argparse
+import sys
+import logging
+import time
+import signal
+
+from botorch.models.contextual_multioutput import LCEMGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch import fit_gpytorch_model
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.models import FixedNoiseMultiTaskGP
+from botorch.acquisition.objective import LinearMCObjective
+from botorch.sampling import IIDNormalSampler
+from botorch.optim import optimize_acqf
+from botorch.acquisition.monte_carlo import qExpectedImprovement
+from botorch.models.transforms.outcome import Standardize
+from botorch.models.transforms.input import Normalize
+from gpytorch.likelihoods import MultitaskGaussianLikelihood, GaussianLikelihood
+from gpytorch.constraints import Interval
+from gpytorch.priors import GammaPrior
+import matplotlib.pyplot as plt
+from gpytorch import settings
+
+from sampling_mtgps import KroneckerMultiTaskGP, MatheronMultiTaskGP
+
+sys.path.append("../../ContextualBO/benchmarks")
+from get_synthetic_problem import get_benchmark_problem
+
+
+# using resource
+import resource
+from numpy import int64
+
+
+def limit_memory():
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    print(soft, hard)
+    # hard = int64(127 * (1000**9))
+    # soft = int64(120 * (1000**9))
+    hard = 28000000000
+    soft = 20000000000
+    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+
+
+def make_and_fit_model(x, y):
+    model = KroneckerMultiTaskGP(x, y, lik_rank=0, has_second_noise=False,)
+
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_torch(mll, options={"maxiter": 25})
+
+    return model
+
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output", type=str, default="results.pt")
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default="Hartmann5DEmbedding",
+        choices=["Branin2D", "Hartmann6D", "Branin1DEmbedding", "Hartmann5DEmbedding"],
+    )
+    parser.add_argument("--contexts", type=int, default=10)
+    parser.add_argument("--love", action="store_true")
+    parser.add_argument("--n_init", type=int, default=100)
+    parser.add_argument("--nt_max", type=int, default=310)
+    return parser.parse_args()
+
+
+def main(
+    n_init: int = 100,
+    seed: int = 0,
+    contexts: int = 10,
+    problem="Hartmann5DEmbedding",
+    love: bool = False,
+    device: str = "cuda",
+    output: str = "result.pt",
+    nt_max: int = 310,
+    # model: str = "hadamard",
+):
+    if love:
+        max_cholesky_size = 4
+        use_love = True
+    else:
+        max_cholesky_size = 5000
+        use_love = False
+
+    torch.random.manual_seed(seed)
+
+    tkwargs = {
+        "dtype": torch.double,
+        "device": torch.device(
+            "cuda:0" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        ),
+    }
+
+    benchmark_problem = get_benchmark_problem(problem, num_contexts=contexts)
+
+    gen_new = lambda X: -benchmark_problem.evaluation_function_vectorized(
+        X.view(1, -1).repeat(contexts, 1).numpy()
+    )
+    gen_new_batch = lambda batch: torch.stack(
+        [torch.from_numpy(gen_new(X.cpu())) for X in batch]
+    ).to(batch)
+
+    def gen_new_for_lcem(batch):
+        reshaped_output = gen_new_batch(batch).view(-1, 1)
+        context_dims = (
+            torch.arange(contexts, **tkwargs)
+            .unsqueeze(0)
+            .repeat(batch.shape[0], 1)
+            .view(-1, 1)
+        )
+        context_stacked_batch = torch.cat(
+            (batch.repeat(1, contexts).view(-1, batch.shape[-1]), context_dims), dim=-1
+        )
+        return context_stacked_batch, reshaped_output
+
+    bounds = torch.tensor(
+        [x["bounds"] for x in benchmark_problem.base_parameters], **tkwargs
+    ).t()
+    bounds_w_taskdim = torch.cat(
+        (bounds, torch.tensor([[0.0], [contexts]], **tkwargs)), dim=-1
+    )
+
+    init_x = (bounds[1] - bounds[0]) * torch.rand(
+        n_init, bounds.shape[1], **tkwargs
+    ) + bounds[0]
+    init_y = gen_new_batch(init_x)
+
+    init_y_lcem = init_y.view(-1, 1)
+    context_dims = (
+        torch.arange(contexts, **tkwargs)
+        .unsqueeze(0)
+        .repeat(init_x.shape[0], 1)
+        .view(-1, 1)
+    )
+    init_x_lcem = torch.cat(
+        (init_x.repeat(1, contexts).view(-1, init_x.shape[-1]), context_dims), dim=-1
+    )
+
+    model1 = make_and_fit_model(init_x, init_y)
+
+    def compute_posterior_samples(test_x, orig_model, samples=256, model="kronecker"):
+        torch.cuda.empty_cache()
+
+        if model != "hadamard":
+            if model == "kronecker":
+                minit = KroneckerMultiTaskGP
+            elif model == "matheron":
+                minit = MatheronMultiTaskGP
+
+            m = minit(init_x, init_y, lik_rank=0, has_second_noise=False,)
+            m.load_state_dict(orig_model.state_dict())
+        else:
+            m = FixedNoiseMultiTaskGP(
+                init_x_lcem,
+                init_y_lcem,
+                model1.likelihood._shaped_noise_covar(init_x.shape).diag().view(-1, 1),
+                task_feature=-1,
+            )
+
+            # now load states
+            m.task_covar_module.covar_factor.data = (
+                orig_model.covar_module.task_covar_module.covar_factor.data
+            )
+            m.task_covar_module.var = orig_model.covar_module.task_covar_module.var.data
+            m.covar_module.base_kernel.lengthscale = (
+                orig_model.covar_module.data_covar_module.lengthscale.data
+            )
+            m.covar_module.outputscale = 1.0
+            m.mean_module.constant.data = orig_model.mean_module(test_x).mean().data
+
+        # global run
+        # while run:
+        try:
+            start = time.time()
+            res = m.posterior(test_x).rsample(torch.Size((samples,)))
+            end = time.time()
+            return end - start
+        except Exception as e:
+            print(e)
+            del m
+            return 1e10
+
+        # if not run:
+        #     run = True
+        #     return 1e-10
+
+    # ntest_setup = [5, 10, 20, 30, 40, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500]
+    ntest_setup = torch.arange(5, nt_max, 25)
+    res_list = []
+    for ntest in ntest_setup:
+        with settings.max_cholesky_size(max_cholesky_size), settings.fast_pred_samples(
+            use_love
+        ), settings.fast_computations(covar_root_decomposition=use_love):
+            print(ntest)
+            curr = []
+            test_x = (bounds[1] - bounds[0]) * torch.rand(
+                ntest, bounds.shape[1], **tkwargs
+            ) + bounds[0]
+
+            # if model == "kronecker":
+            curr.append(compute_posterior_samples(test_x, model1, model="kronecker"))
+            # elif model == "hadamard":
+            curr.append(compute_posterior_samples(test_x, model1, model="hadamard"))
+            # elif model == "matheron":
+            curr.append(compute_posterior_samples(test_x, model1, model="matheron"))
+            res_list.append(curr)
+
+    torch.save(torch.tensor(res_list), output)
+
+
+if __name__ == "__main__":
+    args = parse()
+    limit_memory()
+    main(**vars(args))
+
+File Path: hogp_experiments/data.py
+Content:
+import math
+import numpy as np
+import torch
+
+from botorch.acquisition.objective import GenericMCObjective
+
+# from utils import PRE, cfun
+
+
+def prepare_data(problem, s_size, t_size, device, dtype):
+    if problem == "environmental":
+        print("---- Running the environmental problem with ", s_size, t_size, " ----")
+        # X = [M, D, L, tau]
+        bounds = torch.tensor(
+            [[7.0, 0.02, 0.01, 30.010], [13.0, 0.12, 3.00, 30.295]],
+            device=device,
+            dtype=dtype,
+        )
+
+        M0 = torch.tensor(10.0, device=device, dtype=dtype)
+        D0 = torch.tensor(0.07, device=device, dtype=dtype)
+        L0 = torch.tensor(1.505, device=device, dtype=dtype)
+        tau0 = torch.tensor(30.1525, device=device, dtype=dtype)
+
+        # we can vectorize everything, no need for loops
+        if s_size == 3:
+            S = torch.tensor([0.0, 1.0, 2.5], device=device, dtype=dtype)
+        else:
+            S = torch.linspace(0.0, 2.5, s_size, device=device, dtype=dtype)
+        if t_size == 4:
+            T = torch.tensor([15.0, 30.0, 45.0, 60.0], device=device, dtype=dtype)
+        else:
+            T = torch.linspace(15.0, 60.0, t_size, device=device, dtype=dtype)
+
+        Sgrid, Tgrid = torch.meshgrid(S, T)
+
+        # X = [M, D, L, tau]
+        def c_batched(X, k=None):
+            return torch.stack([env_cfun(Sgrid, Tgrid, *x) for x in X])
+
+        c_true = env_cfun(Sgrid, Tgrid, M0, D0, L0, tau0)
+
+        def neq_sum_quared_diff(samples):
+            # unsqueeze
+            if samples.shape[-1] == (s_size * t_size):
+                samples = samples.unsqueeze(-1).reshape(
+                    *samples.shape[:-1], s_size, t_size
+                )
+
+            sq_diffs = (samples - c_true).pow(2)
+            return sq_diffs.sum(dim=(-1, -2)).mul(-1.0)
+
+        objective = GenericMCObjective(neq_sum_quared_diff)
+        num_samples = 32
+
+    elif problem == "precursor":
+        print("---- Running the precursor problem ----")
+        bounds = torch.tensor(
+            [[-6.0, -6.0, -6.0], [6.0, 6.0, 6.0]], device=device, dtype=dtype,
+        )
+
+        tf = 10
+        dt = 0.01
+
+        def simulate(theta, tf=50, dt=0.01):
+            nsteps = int(tf / dt)
+            pre = PRE(tf, nsteps, theta)
+            u, _ = pre.solve()
+            return u
+
+        def c_batched(X, k=None):
+            return (
+                torch.stack([torch.tensor(simulate(x.cpu(), tf=tf, dt=dt)) for x in X])
+                .to(X.device)
+                .type(dtype)
+            )
+
+        def objective_fn(samples):
+            shapes = [int(tf / dt), 3]
+            if samples.shape[-1] == (shapes[0] * shapes[1]):
+                samples = samples.unsqueeze(-1).reshape(*samples.shape[:-1], *shapes)
+
+            # return -torch.max(samples[..., -1], dim=-1)[0]
+            # differentiable version
+            lse = torch.logsumexp(samples[..., -1], dim=-1).log()
+            return -lse
+
+        objective = GenericMCObjective(objective_fn)
+
+        num_samples = 4
+    elif problem == "maveric1":
+        # from ax.fb.utils.storage.manifold import AEManifoldUseCase
+        # from ax.fb.utils.storage.manifold_torch import AEManifoldTorchClient
+        import sys
+
+        sys.path.append("../../fbc-maveric-research/")
+        from fbc.maveric.simulation_data.simulated_rsrp import SimulatedRSRP
+
+        min_Tx_power_dBm, max_Tx_power_dBm = 30, 50
+
+        # loads the 11 powermap files that are typically mounted in
+        # "/mnt/shared/yuchenq/power_maps/*.npz"
+        # and does the same type of powermap construction as in
+        # fbc.maveric.simulation_data.simulated_rsrp.construct_from_npz_files
+
+        import glob
+        import json
+
+        powermaps = glob.glob("../data/powermatrixDT*.json")
+        all_pmap_dicts = []
+        for pmap_loc in powermaps:
+            with open(pmap_loc, "r") as f:
+                all_pmap_dicts.append(json.load(f))
+
+        downtilts_maps = {}
+        for i in range(11):
+            downtilts_maps[float(i)] = SimulatedRSRP.build_single_powermap(
+                all_pmap_dicts[i]
+            )
+
+        simulated_rsrp = SimulatedRSRP(
+            downtilts_maps=downtilts_maps,
+            min_TX_power_dBm=min_Tx_power_dBm,
+            max_TX_power_dBm=max_Tx_power_dBm,
+        )
+
+        def simulate(theta):
+            theta = theta.cpu().detach().numpy()
+            downtilts = theta[:15].astype(int)
+            tx_pwrs = theta[15:]
+            (
+                rsrp_powermap,
+                interference_powermap,
+                _,
+            ) = simulated_rsrp.get_RSRP_and_interference_powermap((downtilts, tx_pwrs))
+            # return torch.stack(
+            #     (torch.tensor(rsrp_powermap), torch.tensor(interference_powermap))
+            # )
+            highd_res = torch.stack(
+                (torch.tensor(rsrp_powermap), torch.tensor(interference_powermap))
+            )
+            return torch.nn.functional.interpolate(highd_res.unsqueeze(0), (50, 50))[0]
+
+        def c_batched(X, k=None):
+            return torch.stack([simulate(x) for x in X]).to(X.device).type(dtype)
+
+        lower_bounds = torch.tensor([0.0] * 15 + [min_Tx_power_dBm] * 15)
+        upper_bounds = torch.tensor([10.0] * 15 + [max_Tx_power_dBm] * 15)
+        bounds = torch.stack((lower_bounds, upper_bounds))
+
+        # this is a crude, but differentiable version of
+        # fbc/maveric/coverage_capacity_optimization/problem_formulation.py
+        # TODO: use that version
+        def construct_both_objectives(samples):
+            rsrp_map = samples[..., 0, :, :]
+            interference_map = samples[..., 1, :, :]
+
+            weak_coverage_threshold = -80.0
+            over_coverage_threshold = 6.0
+            f_weak_coverage = torch.sigmoid(weak_coverage_threshold - rsrp_map).sum(
+                dim=(-1, -2)
+            )
+            size = np.prod(rsrp_map.shape[-2:])
+
+            # over_coverage_area = (rsrp_map >= weak_coverage_threshold) & (
+            #    interference_map + over_coverage_threshold > rsrp_map
+            # )
+            rsrp_gt_threshold = torch.sigmoid(rsrp_map - weak_coverage_threshold)
+            if_gt_threshold = torch.sigmoid(
+                (interference_map + over_coverage_threshold) - rsrp_map
+            )
+            over_coverage_area = rsrp_gt_threshold * if_gt_threshold
+
+            over_coverage_map = (
+                interference_map * over_coverage_area
+                + over_coverage_threshold
+                - rsrp_map * over_coverage_area
+            )
+            # over_coverage_map = (
+            #     interference_map[over_coverage_area]
+            #     + over_coverage_threshold
+            #     - rsrp_map[over_coverage_area]
+            # )
+            g_weak_coverage = torch.sigmoid(over_coverage_map).sum(dim=(-1, -2))
+            return f_weak_coverage, g_weak_coverage
+
+        # this is a scalarization for now
+        def objective_fn(samples):
+            weight = 0.25
+            f_weak_coverage, g_weak_coverage = construct_both_objectives(samples)
+            return weight * f_weak_coverage + (1.0 - weight) * g_weak_coverage
+
+        objective = GenericMCObjective(objective_fn)
+
+        num_samples = 4
+
+    elif problem == "pde":
+        print("Running the brusselator")
+
+        def cfun(tensor, k=None):
+            from pde import PDE, FieldCollection, ScalarField, UnitGrid
+
+            a = tensor[0].item()
+            b = tensor[1].item()
+            d0 = tensor[2].item()
+            d1 = tensor[3].item()
+
+            eq = PDE(
+                {
+                    "u": f"{d0} * laplace(u) + {a} - ({b} + 1) * u + u**2 * v",
+                    "v": f"{d1} * laplace(v) + {b} * u - u**2 * v",
+                }
+            )
+
+            # initialize state
+            grid = UnitGrid([64, 64])
+            u = ScalarField(grid, a, label="Field $u$")
+            v = b / a + 0.1 * ScalarField.random_normal(grid, label="Field $v$", seed=10)
+            state = FieldCollection([u, v])
+
+            sol = eq.solve(state, t_range=20, dt=1e-3)
+            sol_tensor = torch.stack(
+                (torch.from_numpy(sol[0].data), torch.from_numpy(sol[1].data))
+            )
+            sol_tensor[~torch.isfinite(sol_tensor)] = 1e5 * torch.randn_like(
+                sol_tensor[~torch.isfinite(sol_tensor)]
+            )
+            return sol_tensor
+
+        def c_batched(X, k):
+            return torch.stack([cfun(x) for x in X]).to(X.device).type(dtype)
+
+        def objective_fn(samples, use_var=True):
+            # we want to minimize the variance across the boundaries
+            sz = samples.shape[-1]
+            weighting = (
+                torch.ones(2, sz, sz, device=samples.device, dtype=samples.dtype) / 10
+            )
+            weighting[:, [0, 1, -2, -1], :] = 1.0
+            weighting[:, :, [0, 1, -2, -1]] = 1.0
+
+            weighted_samples = weighting * samples
+            if use_var:
+                return -weighted_samples.var(dim=(-1, -2, -3))
+            else:
+                return -weighted_samples.sum(dim=(-1, -2, -3))
+
+        objective = GenericMCObjective(objective_fn)
+
+        num_samples = 32
+        lb = torch.tensor([0.1, 0.1, 0.01, 0.01])
+        ub = torch.tensor([5.0, 5.0, 5.0, 5.0])
+        bounds = torch.stack((lb, ub))
+    elif problem == "optics":
+        from gym_interf import InterfEnv
+
+        gym_dict = {}
+
+        def metric(image):
+            xx, yy = torch.meshgrid(
+                torch.arange(64, dtype=image.dtype, device=image.device) / 64,
+                torch.arange(64, dtype=image.dtype, device=image.device) / 64,
+            )
+            intens = (-((xx - 0.5) ** 2 + (yy - 0.5) ** 2) / (0.95) ** 2).exp() * image
+            ivec = intens.sum((-1, -2))
+            smax = torch.logsumexp(ivec, -1)
+            smin = -torch.logsumexp(-ivec, -1)
+            v = (smax - smin) / (smax + smin)
+            return v.log()  # - (1 - v).log()
+
+        def cfun(x, k):
+            # if k not in gym_dict.keys():
+            gym_dict[k] = InterfEnv()
+            # gym_dict[k].reset(actions=x[4:].cpu().detach().numpy())
+            gym_dict[k].reset(actions=(1e-4, 1e-4, 1e-4, 1e-4))
+
+            action = x[:4].cpu().detach().numpy()
+            state = gym_dict[k].step(action)
+            return torch.tensor(state[0])
+
+        def c_batched(X, k):
+            return torch.stack([cfun(x, k) for x in X]).to(X.device).type(dtype)
+
+        upper_bounds = torch.ones(4, device=device, dtype=dtype)
+        lower_bounds = -1.0 * upper_bounds
+        bounds = torch.stack((lower_bounds, upper_bounds))
+
+        objective = GenericMCObjective(metric)
+
+        num_samples = 4
+
+    return c_batched, objective, bounds, num_samples
+
+
+def env_cfun(s, t, M, D, L, tau):
+    c1 = M / torch.sqrt(4 * math.pi * D * t)
+    exp1 = torch.exp(-(s ** 2) / 4 / D / t)
+    term1 = c1 * exp1
+    c2 = M / torch.sqrt(4 * math.pi * D * (t - tau))
+    exp2 = torch.exp(-((s - L) ** 2) / 4 / D / (t - tau))
+    term2 = c2 * exp2
+    term2[torch.isnan(term2)] = 0.0
+    return term1 + term2
+
+
+class PRE:
+    def __init__(self, tf, nsteps, u_init, alp=0.01, ome=2 * np.pi, lam=0.1, bet=0.1):
+        self.alp = alp
+        self.ome = ome
+        self.lam = lam
+        self.bet = bet
+        self.tf = tf
+        self.nsteps = nsteps
+        self.u_init = u_init
+
+    def RHS(self, u, t):
+        x1, x2, x3 = u
+        f1 = (
+            self.alp * x1
+            + self.ome * x2
+            + self.alp * x1 ** 2
+            + 2 * self.ome * x1 * x2
+            + x3 ** 2
+        )
+        f2 = -self.ome * x1 + self.alp * x2 - self.ome * x1 ** 2 + 2 * self.alp * x1 * x2
+        f3 = -self.lam * x3 - (self.lam + self.bet) * x1 * x3
+        f = [f1, f2, f3]
+        return f
+
+    def solve(self):
+        time = np.linspace(0, self.tf, self.nsteps + 1)
+        solver = ODESolver(self.RHS)
+        solver.set_ics(self.u_init)
+        u, t = solver.solve(time)
+        return u, t
+
+
+class ODESolver:
+    def __init__(self, f):
+        self.f = lambda u, t: np.asarray(f(u, t), float)
+
+    def set_ics(self, U0):
+        U0 = np.asarray(U0)
+        self.neq = U0.size
+        self.U0 = U0
+
+    def advance(self):
+        u, f, k, t = self.u, self.f, self.k, self.t
+        dt = t[k + 1] - t[k]
+        K1 = dt * f(u[k], t[k])
+        K2 = dt * f(u[k] + 0.5 * K1, t[k] + 0.5 * dt)
+        K3 = dt * f(u[k] + 0.5 * K2, t[k] + 0.5 * dt)
+        K4 = dt * f(u[k] + K3, t[k] + dt)
+        u_new = u[k] + (1 / 6.0) * (K1 + 2 * K2 + 2 * K3 + K4)
+        return u_new
+
+    def solve(self, time):
+        self.t = np.asarray(time)
+        n = self.t.size
+        self.u = np.zeros((n, self.neq))
+        self.u[0] = self.U0
+        for k in range(n - 1):
+            self.k = k
+            self.u[k + 1] = self.advance()
+        return self.u[: k + 2], self.t[: k + 2]
+
+File Path: hogp_experiments/hogp_composite_function.py
+Content:
+#!/usr/bin/env python3
+
+r"""
+Implements a generalized version (added batch evaluation, pending points, KG)
+of what is described in the following paper:
+
+R. Astudillo and P. Frazier. Bayesian optimization of composite functions.
+ICML 2019
+"""
+
+import logging
+import math
+import time
+import warnings
+from typing import Dict, List
+
+import numpy as np
+import torch
+from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
+from botorch.acquisition.monte_carlo import qExpectedImprovement, qSimpleRegret
+from botorch.acquisition.objective import GenericMCObjective
+from botorch.exceptions.warnings import BadInitialCandidatesWarning
+from botorch.fit import fit_gpytorch_model
+from botorch.models import FixedNoiseGP, HigherOrderGP
+from botorch.models.higher_order_gp import FlattenedStandardize
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim import optimize_acqf
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.sampling import IIDNormalSampler
+from botorch.utils.transforms import normalize
+
+# from botorch_fb.models.fidelity.fidelity_utils import warmstart_initialization
+from gpytorch import settings as gpt_settings
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+from data import prepare_data
+from parser import parse
+from utils import (
+    fit_model,
+    fit_hogp_model,
+    gen_rand_points,
+    get_suggested_point,
+    optimize_ei,
+    optimize_kg,
+)
+
+ZEROISH = 1e-7
+
+
+def main(
+    seed: int = 0,
+    n_trials: int = 50,
+    n_init: int = 5,
+    n_batches: int = 10,
+    batch_size: int = 3,
+    num_fantasies: int = 64,
+    num_restarts: int = 16,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 12,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    device: str = "cpu",
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+    output: str = None,
+) -> List[Dict[str, List[float]]]:
+    runner = run_trial_cpu if device == "cpu" else run_trial_gpu
+
+    logging.basicConfig(filename=output[:-3] + ".log", level=logging.DEBUG)
+
+    return [
+        runner(
+            seed=seed,
+            n_init=n_init,
+            n_batches=n_batches,
+            batch_size=batch_size,
+            num_fantasies=num_fantasies,
+            num_restarts=num_restarts,
+            mc_samples=mc_samples,
+            raw_samples=raw_samples,
+            partial_restarts=partial_restarts,
+            batch_limit=batch_limit,
+            maxiter=maxiter,
+            problem=problem,
+            init_batch_limit=init_batch_limit,
+            s_size=s_size,
+            t_size=t_size,
+            max_cf_batch_size=max_cf_batch_size,
+        )
+        for _ in range(n_trials)
+    ]
+
+
+def run_trial_cpu(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+):
+    return run_trial(
+        n_init=n_init,
+        n_batches=n_batches,
+        batch_size=batch_size,
+        num_fantasies=num_fantasies,
+        num_restarts=num_restarts,
+        mc_samples=mc_samples,
+        raw_samples=raw_samples,
+        partial_restarts=partial_restarts,
+        batch_limit=batch_limit,
+        maxiter=maxiter,
+        s_size=s_size,
+        t_size=t_size,
+        problem=problem,
+        init_batch_limit=init_batch_limit,
+        max_cf_batch_size=max_cf_batch_size,
+    )
+
+
+def run_trial_gpu(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    problem: str = "environmental",
+    init_batch_limit: int = 8,
+    max_cf_batch_size: int = 100,
+):
+    return run_trial(
+        seed=seed,
+        n_init=n_init,
+        n_batches=n_batches,
+        batch_size=batch_size,
+        num_fantasies=num_fantasies,
+        num_restarts=num_restarts,
+        mc_samples=mc_samples,
+        raw_samples=raw_samples,
+        partial_restarts=partial_restarts,
+        batch_limit=batch_limit,
+        maxiter=maxiter,
+        s_size=s_size,
+        t_size=t_size,
+        device="cuda",
+        problem=problem,
+        init_batch_limit=init_batch_limit,
+        max_cf_batch_size=max_cf_batch_size,
+    )
+
+
+def run_trial(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    device: str = "cpu",
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+) -> Dict[str, List[float]]:
+
+    torch.random.manual_seed(seed)
+    warnings.filterwarnings("ignore", category=BadInitialCandidatesWarning)
+
+    device = torch.device("cpu") if device == "cpu" else torch.device("cuda:0")
+    dtype = torch.float
+
+    print("Using ", device)
+
+    c_batched, objective, bounds, num_samples = prepare_data(
+        problem, s_size, t_size, device, dtype
+    )
+
+    train_X_init = gen_rand_points(bounds, n_init)
+    train_Y_init = c_batched(train_X_init)
+    num_Y_outputs = np.prod(train_Y_init.shape[1:])
+
+    # these will keep track of the points explored
+
+    if num_Y_outputs <= max_cf_batch_size:
+        models_used = (
+            "rnd",
+            "ei",
+            "ei_hogp_cf",
+            "ei_hogp_cf_smooth",
+            "rnd_cf",
+            "ei_cf",
+        )
+    else:
+        logging.info(
+            "--- Not using RND-CF or EI-CF because number of outputs > threshold ----"
+        )
+        models_used = ("rnd", "ei", "ei_hogp_cf", "ei_hogp_cf_smooth")
+    train_X = {k: train_X_init.clone() for k in models_used}
+    train_Y = {k: train_Y_init.clone() for k in train_X}
+    suggested = {k: [] for k in train_X}
+
+    # run the BO loop
+    for i in range(n_batches):
+        tic = time.time()
+
+        # get best observations, log status
+        best_f = {k: objective(v).max().detach() for k, v in train_Y.items()}
+
+        logging.info(
+            f"It {i+1:>2}/{n_batches}, best obs.: "
+            ", ".join([f"{k}: {v:.3f}" for k, v in best_f.items()])
+        )
+
+        # generate random candidates
+        cands = {}
+        cands["rnd"] = gen_rand_points(bounds, batch_size)
+        cands["rnd_cf"] = gen_rand_points(bounds, batch_size)
+
+        optimize_acqf_kwargs = {
+            "q": batch_size,
+            "num_restarts": num_restarts,
+            "raw_samples": raw_samples,
+            "options": {
+                "batch_limit": batch_limit,
+                "maxiter": maxiter,
+                "nonnegative": True,
+                "method": "L-BFGS-B",
+                "init_batch_limit": init_batch_limit,
+            },
+        }
+        sampler = IIDNormalSampler(num_samples=mc_samples)
+
+        model_rnd = fit_model(
+            normalize(train_X["rnd"], bounds), objective(train_Y["rnd"]).unsqueeze(-1),
+        )
+        suggested["rnd"].append(
+            get_suggested_point(model_rnd, bounds, None, num_samples=num_samples)
+        )
+        del model_rnd
+        torch.cuda.empty_cache()
+
+        if num_Y_outputs <= max_cf_batch_size:
+            model_rnd_cf = fit_model(
+                normalize(train_X["rnd_cf"], bounds), train_Y["rnd_cf"]
+            )
+            suggested["rnd_cf"].append(
+                get_suggested_point(
+                    model_rnd_cf, bounds, objective, num_samples=num_samples
+                )
+            )
+            del model_rnd_cf
+            torch.cuda.empty_cache()
+
+        model_ei = fit_model(
+            normalize(train_X["ei"], bounds), objective(train_Y["ei"]).unsqueeze(-1)
+        )
+        suggested["ei"].append(
+            get_suggested_point(model_ei, bounds, None, num_samples=num_samples)
+        )
+        # generate qEI candidate (single output modeling)
+        qEI = qExpectedImprovement(model_ei, best_f=best_f["ei"], sampler=sampler)
+        cands["ei"] = optimize_ei(qEI, bounds, **optimize_acqf_kwargs)
+        del model_ei
+        torch.cuda.empty_cache()
+
+        if num_Y_outputs <= max_cf_batch_size:
+            model_ei_cf = fit_model(normalize(train_X["ei_cf"], bounds), train_Y["ei_cf"])
+            suggested["ei_cf"].append(
+                get_suggested_point(
+                    model_ei_cf, bounds, objective, num_samples=num_samples
+                )
+            )
+            # generate qEI candidate (multi-output modeling)
+            qEI_cf = qExpectedImprovement(
+                model_ei_cf, best_f=best_f["ei_cf"], sampler=sampler, objective=objective,
+            )
+            cands["ei_cf"] = optimize_ei(qEI_cf, bounds, **optimize_acqf_kwargs)
+            del model_ei_cf
+            torch.cuda.empty_cache()
+
+        model_ei_hogp_cf = fit_hogp_model(
+            normalize(train_X["ei_hogp_cf"], bounds), train_Y["ei_hogp_cf"]
+        )
+        suggested["ei_hogp_cf"].append(
+            get_suggested_point(
+                model_ei_hogp_cf, bounds, objective, num_samples=num_samples
+            )
+        )
+        # generate qEI candidate (multi-output modeling)
+        qEI_hogp_cf = qExpectedImprovement(
+            model_ei_hogp_cf,
+            best_f=best_f["ei_hogp_cf"],
+            sampler=sampler,
+            objective=objective,
+        )
+        cands["ei_hogp_cf"] = optimize_ei(qEI_hogp_cf, bounds, **optimize_acqf_kwargs)
+        del model_ei_hogp_cf
+        torch.cuda.empty_cache()
+
+        model_ei_hogp_cf_smooth = fit_hogp_model(
+            normalize(train_X["ei_hogp_cf_smooth"], bounds),
+            train_Y["ei_hogp_cf_smooth"],
+            "gp",
+        )
+        suggested["ei_hogp_cf_smooth"].append(
+            get_suggested_point(
+                model_ei_hogp_cf_smooth, bounds, objective, num_samples=num_samples
+            )
+        )
+        # generate qEI candidate (multi-output modeling)
+        qEI_hogp_cf_smooth = qExpectedImprovement(
+            model_ei_hogp_cf_smooth,
+            best_f=best_f["ei_hogp_cf_smooth"],
+            sampler=sampler,
+            objective=objective,
+        )
+        cands["ei_hogp_cf_smooth"] = optimize_ei(
+            qEI_hogp_cf_smooth, bounds, **optimize_acqf_kwargs
+        )
+        del model_ei_hogp_cf_smooth
+        torch.cuda.empty_cache()
+
+        # fit models
+        # models = {
+        #     # "kg": fit_model(
+        #     #     normalize(train_X["kg"], bounds), objective(train_Y["kg"]).unsqueeze(-1)
+        #     # ),
+        #     # "kg_cf": fit_model(normalize(train_X["kg_cf"], bounds), train_Y["kg_cf"]),
+        # }
+
+        # get suggested points (max posterior mean)
+
+        # # get full solution for KG for warm-starting
+        # soln_kg = get_suggested_point(
+        #     models["kg"], bounds, None, return_best_only=False
+        # )
+        # soln_kg_cf = get_suggested_point(
+        #     models["kg_cf"], bounds, objective, return_best_only=False
+        # )
+        # suggested["kg"].append(soln_kg[0, 0])
+        # suggested["kg_cf"].append(soln_kg_cf[0, 0])
+
+        # generate qKG candidate (single output modeling)
+        # qKG = qKnowledgeGradient(
+        #     models["kg"], num_fantasies=num_fantasies, inner_sampler=sampler
+        # )
+        # cands["kg"] = optimize_kg(
+        #     qKG,
+        #     bounds,
+        #     current_soln=soln_kg,
+        #     partial_restarts=partial_restarts,
+        #     **optimize_acqf_kwargs,
+        # )
+
+        # # generate qEI candidate (multi-output modeling)
+        # qKG_cf = qKnowledgeGradient(
+        #     models["kg_cf"],
+        #     num_fantasies=num_fantasies,
+        #     inner_sampler=sampler,
+        #     objective=objective,
+        # )
+        # cands["kg_cf"] = optimize_kg(
+        #     qKG_cf,
+        #     bounds,
+        #     current_soln=soln_kg_cf,
+        #     partial_restarts=partial_restarts,
+        #     **optimize_acqf_kwargs,
+        # )
+
+        # make observations and update data
+        for k, Xold in train_X.items():
+            Xnew = cands[k]
+            if Xnew.shape[0] > 0:
+                train_X[k] = torch.cat([Xold, Xnew])
+                train_Y[k] = torch.cat([train_Y[k], c_batched(Xnew)])
+
+        logging.info(f"Wall time: {time.time() - tic:1f}")
+        torch.cuda.empty_cache()
+
+    sugg_vals = {}
+    for k, v in suggested.items():
+        if len(v) > 0:
+            sugg_vals[k] = objective(c_batched(torch.stack(v))).tolist()
+        else:
+            sugg_vals[k] = v
+    return sugg_vals, train_X
+
+
+if __name__ == "__main__":
+    args = parse()
+    result = main(**vars(args))
+    torch.save(result, args.output)
+
+File Path: hogp_experiments/hogp_optics.py
+Content:
+#!/usr/bin/env python3
+
+r"""
+Implements a generalized version (added batch evaluation, pending points, KG)
+of what is described in the following paper:
+
+R. Astudillo and P. Frazier. Bayesian optimization of composite functions.
+ICML 2019
+"""
+
+import logging
+import math
+import time
+import warnings
+from typing import Dict, List
+
+import numpy as np
+import torch
+from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
+from botorch.acquisition.monte_carlo import qExpectedImprovement, qSimpleRegret
+from botorch.acquisition.objective import GenericMCObjective
+from botorch.exceptions.warnings import BadInitialCandidatesWarning
+from botorch.fit import fit_gpytorch_model
+from botorch.models import FixedNoiseGP, HigherOrderGP
+from botorch.models.higher_order_gp import FlattenedStandardize
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim import optimize_acqf
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.sampling import IIDNormalSampler
+from botorch.utils.transforms import normalize
+
+# from botorch_fb.models.fidelity.fidelity_utils import warmstart_initialization
+from gpytorch import settings as gpt_settings
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+from data import prepare_data
+from parser import parse
+from utils import (
+    fit_model,
+    fit_hogp_model,
+    gen_rand_points,
+    get_suggested_point,
+    optimize_ei,
+    optimize_kg,
+)
+
+ZEROISH = 1e-7
+
+
+def main(
+    seed: int = 0,
+    n_trials: int = 50,
+    n_init: int = 5,
+    n_batches: int = 10,
+    batch_size: int = 3,
+    num_fantasies: int = 64,
+    num_restarts: int = 16,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 12,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    device: str = "cpu",
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+    output: str = None,
+) -> List[Dict[str, List[float]]]:
+    runner = run_trial_cpu if device == "cpu" else run_trial_gpu
+
+    logging.basicConfig(filename=output[:-3] + ".log", level=logging.DEBUG)
+
+    return [
+        runner(
+            seed=seed,
+            n_init=n_init,
+            n_batches=n_batches,
+            batch_size=batch_size,
+            num_fantasies=num_fantasies,
+            num_restarts=num_restarts,
+            mc_samples=mc_samples,
+            raw_samples=raw_samples,
+            partial_restarts=partial_restarts,
+            batch_limit=batch_limit,
+            maxiter=maxiter,
+            problem=problem,
+            init_batch_limit=init_batch_limit,
+            s_size=s_size,
+            t_size=t_size,
+            max_cf_batch_size=max_cf_batch_size,
+        )
+        for _ in range(n_trials)
+    ]
+
+
+def run_trial_cpu(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+):
+    return run_trial(
+        n_init=n_init,
+        n_batches=n_batches,
+        batch_size=batch_size,
+        num_fantasies=num_fantasies,
+        num_restarts=num_restarts,
+        mc_samples=mc_samples,
+        raw_samples=raw_samples,
+        partial_restarts=partial_restarts,
+        batch_limit=batch_limit,
+        maxiter=maxiter,
+        s_size=s_size,
+        t_size=t_size,
+        problem=problem,
+        init_batch_limit=init_batch_limit,
+        max_cf_batch_size=max_cf_batch_size,
+    )
+
+
+def run_trial_gpu(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    problem: str = "environmental",
+    init_batch_limit: int = 8,
+    max_cf_batch_size: int = 100,
+):
+    return run_trial(
+        seed=seed,
+        n_init=n_init,
+        n_batches=n_batches,
+        batch_size=batch_size,
+        num_fantasies=num_fantasies,
+        num_restarts=num_restarts,
+        mc_samples=mc_samples,
+        raw_samples=raw_samples,
+        partial_restarts=partial_restarts,
+        batch_limit=batch_limit,
+        maxiter=maxiter,
+        s_size=s_size,
+        t_size=t_size,
+        device="cuda",
+        problem=problem,
+        init_batch_limit=init_batch_limit,
+        max_cf_batch_size=max_cf_batch_size,
+    )
+
+
+def run_trial(
+    n_init: int,
+    n_batches: int,
+    batch_size: int,
+    seed: int = 0,
+    num_fantasies: int = 32,
+    num_restarts: int = 8,
+    mc_samples: int = 256,
+    raw_samples: int = 512,
+    partial_restarts: int = 6,
+    batch_limit: int = 4,
+    init_batch_limit: int = 8,
+    maxiter: int = 200,
+    s_size: int = 3,
+    t_size: int = 4,
+    device: str = "cpu",
+    problem: str = "environmental",
+    max_cf_batch_size: int = 100,
+) -> Dict[str, List[float]]:
+
+    torch.random.manual_seed(seed)
+    warnings.filterwarnings("ignore", category=BadInitialCandidatesWarning)
+
+    device = torch.device("cpu") if device == "cpu" else torch.device("cuda:0")
+    dtype = torch.float
+
+    print("Using ", device)
+
+    c_batched, objective, bounds, num_samples = prepare_data(
+        problem, s_size, t_size, device, dtype
+    )
+
+    train_X_init = gen_rand_points(bounds, n_init)
+    # train_Y_init = c_batched(train_X_init)
+
+    # these will keep track of the points explored
+    models_used = ("rnd", "ei", "ei_hogp_cf", "ei_hogp_cf_smooth")
+    train_X = {k: train_X_init.clone() for k in models_used}
+    # train_Y = {k: train_Y_init.clone() for k in train_X}
+    train_Y = {k: c_batched(train_X_init, k) for k in train_X}
+    train_Y_init = train_Y["rnd"]
+    num_Y_outputs = np.prod(train_Y_init.shape[1:])
+    suggested = {k: [] for k in train_X}
+
+    # run the BO loop
+    for i in range(n_batches):
+        tic = time.time()
+
+        # get best observations, log status
+        best_f = {k: objective(v).max().detach() for k, v in train_Y.items()}
+
+        logging.info(
+            f"It {i+1:>2}/{n_batches}, best obs.: "
+            ", ".join([f"{k}: {v:.3f}" for k, v in best_f.items()])
+        )
+
+        # generate random candidates
+        cands = {}
+        cands["rnd"] = gen_rand_points(bounds, batch_size)
+        cands["rnd_cf"] = gen_rand_points(bounds, batch_size)
+
+        optimize_acqf_kwargs = {
+            "q": batch_size,
+            "num_restarts": num_restarts,
+            "raw_samples": raw_samples,
+            "options": {
+                "batch_limit": batch_limit,
+                "maxiter": maxiter,
+                "nonnegative": True,
+                "method": "L-BFGS-B",
+                "init_batch_limit": init_batch_limit,
+            },
+        }
+        sampler = IIDNormalSampler(num_samples=mc_samples)
+
+        model_rnd = fit_model(
+            normalize(train_X["rnd"], bounds), objective(train_Y["rnd"]).unsqueeze(-1),
+        )
+        suggested["rnd"].append(
+            get_suggested_point(model_rnd, bounds, None, num_samples=num_samples)
+        )
+        del model_rnd
+        torch.cuda.empty_cache()
+
+        if num_Y_outputs <= max_cf_batch_size:
+            model_rnd_cf = fit_model(
+                normalize(train_X["rnd_cf"], bounds), train_Y["rnd_cf"]
+            )
+            suggested["rnd_cf"].append(
+                get_suggested_point(
+                    model_rnd_cf, bounds, objective, num_samples=num_samples
+                )
+            )
+            del model_rnd_cf
+            torch.cuda.empty_cache()
+
+        # last_x = normalize(train_X["ei"], bounds)[-1]
+        # fixed_features = {4: last_x[0], 5: last_x[1], 6: last_x[2], 7: last_x[3]}
+        fixed_features = None
+        model_ei = fit_model(
+            normalize(train_X["ei"], bounds), objective(train_Y["ei"]).unsqueeze(-1)
+        )
+        suggested["ei"].append(
+            get_suggested_point(
+                model_ei,
+                bounds,
+                None,
+                num_samples=num_samples,
+                fixed_features=fixed_features,
+            )
+        )
+        # generate qEI candidate (single output modeling)
+        qEI = qExpectedImprovement(model_ei, best_f=best_f["ei"], sampler=sampler)
+        cands["ei"] = optimize_ei(
+            qEI, bounds, **optimize_acqf_kwargs, fixed_features=fixed_features,
+        )
+        print(cands["ei"])
+        del model_ei
+        torch.cuda.empty_cache()
+
+        if num_Y_outputs <= max_cf_batch_size:
+            model_ei_cf = fit_model(normalize(train_X["ei_cf"], bounds), train_Y["ei_cf"])
+            suggested["ei_cf"].append(
+                get_suggested_point(
+                    model_ei_cf, bounds, objective, num_samples=num_samples
+                )
+            )
+            # generate qEI candidate (multi-output modeling)
+            qEI_cf = qExpectedImprovement(
+                model_ei_cf, best_f=best_f["ei_cf"], sampler=sampler, objective=objective,
+            )
+            cands["ei_cf"] = optimize_ei(qEI_cf, bounds, **optimize_acqf_kwargs)
+            del model_ei_cf
+            torch.cuda.empty_cache()
+
+        last_x = normalize(train_X["ei_hogp_cf"], bounds)[-1]
+        fixed_features = {4: last_x[0], 5: last_x[1], 6: last_x[2], 7: last_x[3]}
+
+        model_ei_hogp_cf = fit_hogp_model(
+            normalize(train_X["ei_hogp_cf"], bounds), train_Y["ei_hogp_cf"]
+        )
+        suggested["ei_hogp_cf"].append(
+            get_suggested_point(
+                model_ei_hogp_cf,
+                bounds,
+                objective,
+                num_samples=num_samples,
+                fixed_features=fixed_features,
+            )
+        )
+        # generate qEI candidate (multi-output modeling)
+        qEI_hogp_cf = qExpectedImprovement(
+            model_ei_hogp_cf,
+            best_f=best_f["ei_hogp_cf"],
+            sampler=sampler,
+            objective=objective,
+        )
+        cands["ei_hogp_cf"] = optimize_ei(
+            qEI_hogp_cf, bounds, **optimize_acqf_kwargs, fixed_features=fixed_features,
+        )
+        del model_ei_hogp_cf
+        torch.cuda.empty_cache()
+
+        last_x = normalize(train_X["ei_hogp_cf_smooth"], bounds)[-1]
+        fixed_features = {4: last_x[0], 5: last_x[1], 6: last_x[2], 7: last_x[3]}
+        model_ei_hogp_cf_smooth = fit_hogp_model(
+            normalize(train_X["ei_hogp_cf_smooth"], bounds),
+            train_Y["ei_hogp_cf_smooth"],
+            "gp",
+        )
+        suggested["ei_hogp_cf_smooth"].append(
+            get_suggested_point(
+                model_ei_hogp_cf_smooth,
+                bounds,
+                objective,
+                num_samples=num_samples,
+                fixed_features=fixed_features,
+            )
+        )
+        # generate qEI candidate (multi-output modeling)
+        qEI_hogp_cf_smooth = qExpectedImprovement(
+            model_ei_hogp_cf_smooth,
+            best_f=best_f["ei_hogp_cf_smooth"],
+            sampler=sampler,
+            objective=objective,
+        )
+        cands["ei_hogp_cf_smooth"] = optimize_ei(
+            qEI_hogp_cf_smooth,
+            bounds,
+            **optimize_acqf_kwargs,
+            fixed_features=fixed_features,
+        )
+        del model_ei_hogp_cf_smooth
+        torch.cuda.empty_cache()
+
+        # make observations and update data
+        for k, Xold in train_X.items():
+            Xnew = cands[k]
+            if Xnew.shape[0] > 0:
+                train_X[k] = torch.cat([Xold, Xnew])
+                train_Y[k] = torch.cat([train_Y[k], c_batched(Xnew, k)])
+
+        logging.info(f"Wall time: {time.time() - tic:1f}")
+        torch.cuda.empty_cache()
+
+    sugg_vals = {}
+    for k, v in suggested.items():
+        if len(v) > 0:
+            sugg_vals[k] = objective(c_batched(torch.stack(v), k)).tolist()
+        else:
+            sugg_vals[k] = v
+    return sugg_vals, train_X
+
+
+if __name__ == "__main__":
+    args = parse()
+    result = main(**vars(args))
+    torch.save(result, args.output)
+
+File Path: hogp_experiments/parser.py
+Content:
+import argparse
+
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seed", type=int, help="(int) seed", default=10,
+    )
+    parser.add_argument(
+        "--n_trials", type=int, help="(int) number of initial points", default=1,
+    )
+    parser.add_argument(
+        "--n_init", type=int, help="(int) number of initial points", default=5,
+    )
+    parser.add_argument(
+        "--n_batches", type=int, help="(int) number of initial points", default=10,
+    )
+    parser.add_argument(
+        "--batch_size", type=int, help="(int) number of initial points", default=3,
+    )
+    parser.add_argument(
+        "--num_fantasies", type=int, help="(int) number of initial points", default=64,
+    )
+    parser.add_argument(
+        "--num_restarts", type=int, help="(int) number of initial points", default=16,
+    )
+    parser.add_argument(
+        "--mc_samples", type=int, help="(int) number of initial points", default=256,
+    )
+    parser.add_argument(
+        "--raw_samples", type=int, help="(int) number of initial points", default=512,
+    )
+    parser.add_argument(
+        "--partial_restarts", type=int, help="(int) number of initial points", default=12,
+    )
+    parser.add_argument(
+        "--batch_limit", type=int, help="(int) number of initial points", default=4,
+    )
+    parser.add_argument(
+        "--init_batch_limit", type=int, help="(int) number of initial points", default=8,
+    )
+    parser.add_argument(
+        "--maxiter", type=int, help="(int) number of initial points", default=200,
+    )
+    parser.add_argument(
+        "--s_size", type=int, help="(int) number of initial points", default=3,
+    )
+    parser.add_argument(
+        "--t_size", type=int, help="(int) number of initial points", default=4,
+    )
+    parser.add_argument(
+        "--device", type=str, help="(int) number of initial points", default="gpu",
+    )
+    parser.add_argument(
+        "--problem",
+        type=str,
+        help="(int) number of initial points",
+        default="environmental",
+    )
+    parser.add_argument(
+        "--max_cf_batch_size",
+        type=int,
+        help="(int) number of initial points",
+        default=100,
+    )
+    parser.add_argument(
+        "--output", type=str, help="(str) output file", default="result.pt"
+    )
+    return parser.parse_args()
+
+File Path: hogp_experiments/utils.py
+Content:
+import math
+import torch
+import numpy as np
+
+from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
+from botorch.acquisition.monte_carlo import qExpectedImprovement, qSimpleRegret
+from botorch.acquisition.objective import GenericMCObjective
+from botorch.exceptions.warnings import BadInitialCandidatesWarning
+from botorch.fit import fit_gpytorch_model
+from botorch.models import FixedNoiseGP, HigherOrderGP
+from botorch.models.higher_order_gp import FlattenedStandardize
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim import optimize_acqf
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.sampling import IIDNormalSampler
+from botorch.utils.transforms import normalize
+from botorch.utils.sampling import draw_sobol_samples
+
+# from botorch_fb.models.fidelity.fidelity_utils import warmstart_initialization
+from gpytorch import settings as gpt_settings
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+ZEROISH = 1e-7
+
+
+def fit_model(train_X, train_Y):
+    if train_X.ndim != train_Y.ndim:
+        train_Y = train_Y.reshape(train_Y.shape[0], np.prod(train_Y.shape[1:]))
+
+    model = FixedNoiseGP(
+        train_X,
+        train_Y,
+        torch.full_like(train_Y, ZEROISH),
+        # input_transform=Normalize(train_X.shape[-1]),
+        outcome_transform=Standardize(train_Y.shape[-1]),
+    )
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_model(mll)
+    return model
+
+
+def fit_hogp_model(train_X, train_Y, latent_init="default", fixed_noise=True):
+    model = HigherOrderGP(
+        train_X,
+        train_Y,
+        outcome_transform=FlattenedStandardize(train_Y.shape[1:]),
+        latent_init=latent_init,
+    )
+    if fixed_noise:
+        model.likelihood.noise = ZEROISH
+        model.likelihood.raw_noise.detach_()
+
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    # init the likelihood to be similar to ZEROISH
+    # model.likelihood.noise = 1e-3
+    if np.prod(train_Y.shape[1:]) > 500:
+        print("Large number of output dims, using torch")
+        fit_gpytorch_torch(mll, options={"lr": 0.01, "maxiter": 3000})
+    else:
+        fit_gpytorch_model(mll)
+    return model
+
+
+def gen_rand_points(bounds, num_samples):
+    points_nlzd = torch.rand(num_samples, bounds.shape[-1]).to(bounds)
+    return bounds[0] + (bounds[1] - bounds[0]) * points_nlzd
+
+
+def get_suggested_point(
+    model, bounds, objective, return_best_only=True, num_samples=32, fixed_features=None,
+):
+    bounds_nlzd = (bounds - bounds[0]) / (bounds[1] - bounds[0])
+    sampler = IIDNormalSampler(num_samples=num_samples)
+
+    acqf = qSimpleRegret(model, objective=objective, sampler=sampler)
+
+    batch_initial_conditions = draw_sobol_samples(bounds=bounds, q=1, n=1)
+
+    try:
+        with gpt_settings.fast_computations(covar_root_decomposition=False):
+            sugg_cand_nlzd, _ = optimize_acqf(
+                acqf,
+                bounds_nlzd,
+                q=1,
+                num_restarts=1,
+                raw_samples=num_samples,
+                return_best_only=return_best_only,
+                batch_initial_conditions=batch_initial_conditions,
+                fixed_features=fixed_features,
+            )
+        if return_best_only:
+            sugg_cand_nlzd = sugg_cand_nlzd[0]
+        return bounds[0] + (bounds[1] - bounds[0]) * sugg_cand_nlzd
+    except RuntimeError:
+        # if e.message == "probability tensor contains either `inf`, `nan` or element < 0":
+        print("Warning: optimization failed")
+        try:
+            X = model.train_inputs[0]
+            post_samples = sampler(model.posterior(X))
+            if objective is not None:
+                obj_values = objective(post_samples)
+            else:
+                obj_values = post_samples
+            best_obj = obj_values.max(dim=(0))[0].argmax()
+
+            if return_best_only:
+                sugg_cand_nlzd = X[best_obj]
+            return bounds[0] + (bounds[1] - bounds[0]) * sugg_cand_nlzd
+        except RuntimeError:
+            return bounds[0] + (bounds[1] - bounds[0]) * X[0]
+
+
+def optimize_ei(qEI, bounds, **options):
+    bounds_nlzd = (bounds - bounds[0]) / (bounds[1] - bounds[0])
+
+    batch_initial_conditions = draw_sobol_samples(
+        bounds=bounds,
+        q=options["q"],
+        n=options["num_restarts"] * options["options"]["batch_limit"],
+    )
+
+    try:
+        with gpt_settings.fast_computations(covar_root_decomposition=False):
+            cands_nlzd, _ = optimize_acqf(
+                qEI,
+                bounds_nlzd,
+                batch_initial_conditions=batch_initial_conditions,
+                **options
+            )
+        return bounds[0] + (bounds[1] - bounds[0]) * cands_nlzd
+    except:
+        print("--- Warning BO Loop failed; trying a random point instead ---")
+        rand_cand = torch.rand(
+            options["q"],
+            qEI.model.train_inputs[0].shape[-1],
+            device=bounds.device,
+            dtype=bounds.dtype,
+        )
+        return bounds[0] + (bounds[1] - bounds[0]) * rand_cand
+
+
+def optimize_kg(qKG, bounds, current_soln=None, **options):
+    bounds_nlzd = (bounds - bounds[0]) / (bounds[1] - bounds[0])
+    batch_initial_conditions = warmstart_initialization(
+        acq_function=qKG,
+        bounds=bounds_nlzd,
+        q=options["q"],
+        num_restarts=options.get("num_restarts"),
+        raw_samples=options.get("raw_samples"),
+        current_soln=current_soln,
+        partial_restarts=options.get("partial_restarts"),
+    )
+    with gpt_settings.fast_pred_var(), gpt_settings.fast_computations(
+        covar_root_decomposition=False, log_prob=False, solves=False
+    ), gpt_settings.max_cholesky_size(1000):
+        cands_nlzd, _ = optimize_acqf(
+            acq_function=qKG,
+            bounds=bounds_nlzd,
+            q=options["q"],
+            num_restarts=options.get("num_restarts"),
+            raw_samples=options.get("raw_samples"),
+            options=options.get("options", {}),
+            batch_initial_conditions=batch_initial_conditions,
+        )
+    cands_nlzd = qKG.extract_candidates(cands_nlzd.detach().unsqueeze(0))
+    return bounds[0] + (bounds[1] - bounds[0]) * cands_nlzd[0]
+
+File Path: mtgp_experiments/constrained_mobo.py
+Content:
+import time
+import warnings
+import torch
+import argparse
+import logging
+
+from botorch import fit_gpytorch_model
+from botorch.exceptions import BadInitialCandidatesWarning
+from botorch.optim.fit import fit_gpytorch_torch
+from botorch.sampling.samplers import SobolQMCNormalSampler, IIDNormalSampler
+from botorch.utils.multi_objective.pareto import is_non_dominated
+from botorch.utils.multi_objective.hypervolume import Hypervolume
+
+warnings.filterwarnings("ignore", category=BadInitialCandidatesWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+from mobo_utils import (
+    parse,
+    optimize_qehvi_and_get_observation,
+    generate_initial_data,
+    initialize_model,
+    get_constrained_mc_objective,
+    optimize_qparego_and_get_observation,
+    generate_problem,
+)
+
+
+def main(
+    output: str = "results.pt",
+    device: str = "cuda",
+    problem: str = "c2dtlz2",
+    seed: int = 0,
+    n_batch: int = 50,
+    mc_samples: int = 128,
+    batch_size: int = 2,
+):
+    logging.basicConfig(filename=output[:-3] + ".log", level=logging.DEBUG)
+
+    tkwargs = {
+        "dtype": torch.double,
+        "device": torch.device(
+            "cuda:0" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        ),
+    }
+
+    problem, standard_bounds = generate_problem(problem, tkwargs)
+    d = problem.dim
+
+    verbose = True
+    hv = Hypervolume(ref_point=problem.ref_point)
+
+    torch.manual_seed(seed)
+
+    model_types = [
+        "rnd",
+        "qparego",
+        "qparego_ind",
+        "qehvi",
+        "qehvi_ind",
+    ]
+
+    train_x_qparego, train_obj_qparego, train_con_qparego = generate_initial_data(
+        problem, n=2 * (d + 1), method="rejection"
+    )
+
+    # compute pareto front
+    is_feas = (train_con_qparego <= 0).all(dim=-1)
+    feas_train_obj = train_obj_qparego[is_feas]
+    pareto_mask = is_non_dominated(feas_train_obj)
+    pareto_y = feas_train_obj[pareto_mask]
+    # compute hypervolume
+
+    volume = hv.compute(pareto_y)
+
+    hvs_dict = {}
+    data_dict = {}
+    for m in model_types:
+        # assign volume
+        hvs_dict[m] = [volume]
+        # assign initial data
+        data_dict[m] = [train_x_qparego, train_obj_qparego, train_con_qparego]
+
+    logging.info("Beginning trial with {n_batch} iterations")
+    # run N_BATCH rounds of BayesOpt after the initial random batch
+    for iteration in range(1, n_batch + 1):
+        model_dict = {}
+        for m in model_types:
+            # and models
+            if m == "qparego" or m == "qehvi":
+                model_dict[m] = initialize_model(
+                    *data_dict[m], bounds=standard_bounds, model_type="mmtgp"
+                )
+            elif m == "qparego_ind" or m == "qehvi_ind":
+                model_dict[m] = initialize_model(
+                    *data_dict[m], bounds=standard_bounds, model_type="ind"
+                )
+        #             elif m == "qparego_mtgp" or m == "qehvi_mtgp":
+        #                 model_dict[m] = initialize_model(
+        #                     *data_dict[m], bounds=standard_bounds, model_type="mtgp"
+        #                 )
+
+        t0 = time.time()
+
+        # fit the models
+        for m in model_types[1:]:
+            # fit_gpytorch_model(model_dict[m][0])
+            fit_gpytorch_torch(model_dict[m][0], options={"maxiter": 250})
+
+        # define sampler and get new data points
+        new_points_dict = {}
+        new_points_dict["rnd"] = generate_initial_data(problem, n=batch_size)
+        for m in model_types[1:]:
+            sampler = IIDNormalSampler(num_samples=mc_samples)
+            if m[:7] == "qparego":
+                optim_fn = optimize_qparego_and_get_observation
+            else:
+                optim_fn = optimize_qehvi_and_get_observation
+
+            new_x, new_obj, new_con = optim_fn(
+                problem,
+                model_dict[m][1],
+                *data_dict[m][1:],
+                sampler,
+                tkwargs,
+                standard_bounds,
+                batch_size,
+            )
+            new_points_dict[m] = [new_x, new_obj, new_con]
+            torch.cuda.empty_cache()
+
+        for m in model_types:
+            data_dict[m][0] = torch.cat([data_dict[m][0], new_points_dict[m][0]])
+            data_dict[m][1] = torch.cat([data_dict[m][1], new_points_dict[m][1]])
+            data_dict[m][2] = torch.cat([data_dict[m][2], new_points_dict[m][2]])
+
+        for m in model_types:
+            _, train_obj, train_con = data_dict[m]
+            # compute pareto front
+            is_feas = (train_con <= 0).all(dim=-1)
+            feas_train_obj = train_obj[is_feas]
+            pareto_mask = is_non_dominated(feas_train_obj)
+            pareto_y = feas_train_obj[pareto_mask]
+            # compute feasible hypervolume
+            volume = hv.compute(pareto_y)
+            hvs_dict[m].append(volume)
+
+        # reinitialize the models so they are ready for fitting on next iteration
+        # Note: we find improved performance from not warm starting the model hyperparameters
+        # using the hyperparameters from the previous iteration
+        del model_dict
+
+        t1 = time.time()
+
+        if verbose:
+            logging.info(
+                f"\nBatch {iteration:>2}: Hypervolume = "
+                + str([[k, max(x)] for k, x in hvs_dict.items()])
+                + f"time = {t1-t0:>4.2f}."  # f"({hvs_dict["rnd"]:>4.2f}, {hvs_dict["qparego"]:>4.2f})"#, {hvs_dict["qehvi"]:>4.2f}, {hvs_dict["qparego_ind"]:>4.2f}, {hvs_dict["qehvi_ind"]:>4.2f})"
+            )
+        else:
+            logging.info(".")
+
+    cpu_data_dict = {}
+    for m in model_types:
+        cpu_data_dict[m] = [x.cpu().detach() for x in data_dict[m]]
+
+    torch.save({"hvs": hvs_dict, "data": cpu_data_dict}, output)
+
+
+if __name__ == "__main__":
+    args = parse()
+    main(**vars(args))
+
+File Path: mtgp_experiments/mobo_utils.py
+Content:
+import torch
+import argparse
+
+from sampling_mtgps.matheron_mtgp import KroneckerMultiTaskGP, MatheronMultiTaskGP
+from botorch.models.gp_regression import SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
+from botorch.models.transforms.input import Normalize
+from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
+from botorch.utils.transforms import unnormalize
+from botorch.utils.sampling import draw_sobol_samples
+
+from botorch.optim.optimize import optimize_acqf, optimize_acqf_list
+from botorch.acquisition.objective import GenericMCObjective
+from botorch.acquisition.multi_objective.objective import IdentityMCMultiOutputObjective
+from botorch.utils.multi_objective.scalarization import get_chebyshev_scalarization
+from botorch.utils.multi_objective.box_decomposition import NondominatedPartitioning
+from botorch.acquisition.multi_objective.monte_carlo import (
+    qExpectedHypervolumeImprovement,
+)
+from botorch.utils.sampling import sample_simplex
+
+from botorch.acquisition.objective import ConstrainedMCObjective
+from botorch.acquisition.monte_carlo import (
+    qExpectedImprovement,
+    qNoisyExpectedImprovement,
+)
+
+
+def parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output", type=str, default="results.pt")
+    parser.add_argument("--problem", type=str, default="c2dtlz2")
+    parser.add_argument("--n_batch", type=int, default=50)
+    parser.add_argument("--mc_samples", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=2)
+    return parser.parse_args()
+
+
+def optimize_qehvi_and_get_observation(
+    problem, model, train_obj, train_con, sampler, twkwargs, standard_bounds, batch_size
+):
+    """Optimizes the qEHVI acquisition function, and returns a new candidate and observation."""
+    # compute feasible observations
+    n_obj = train_obj.shape[-1]
+    n_con = train_con.shape[-1]
+
+    is_feas = (train_con <= 0).all(dim=-1)
+    # compute points that are better than the known reference point
+    better_than_ref = (train_obj > problem.ref_point).all(dim=-1)
+    # partition non-dominated space into disjoint rectangles
+    partitioning = NondominatedPartitioning(
+        num_outcomes=problem.num_objectives,
+        # use observations that are better than the specified reference point and feasible
+        Y=train_obj[better_than_ref & is_feas],
+    )
+    acq_func = qExpectedHypervolumeImprovement(
+        model=model,
+        ref_point=problem.ref_point.tolist(),  # use known reference point
+        partitioning=partitioning,
+        sampler=sampler,
+        # define an objective that specifies which outcomes are the objectives
+        objective=IdentityMCMultiOutputObjective(outcomes=[0, 1]),
+        # specify that the constraint is on the last outcome
+        constraints=[
+            lambda Z, dim=dim: Z[..., dim] for dim in range(n_obj, n_obj + n_con)
+        ],
+    )
+    # optimize
+    candidates, _ = optimize_acqf(
+        acq_function=acq_func,
+        bounds=standard_bounds,
+        q=batch_size,
+        num_restarts=10,
+        raw_samples=512,  # used for intialization heuristic
+        options={
+            "batch_limit": 5,
+            "maxiter": 200,
+            "init_batch_limit": 20,
+            "nonnegative": True,
+        },
+        sequential=True,
+    )
+    # observe new values
+    # new_x =  unnormalize(candidates.detach(), bounds=problem.bounds)
+    new_x = candidates.detach()
+    new_obj = problem(new_x)
+    # negative values imply feasibility in botorch
+    new_con = -problem.evaluate_slack(new_x)
+    return new_x, new_obj, new_con
+
+
+def generate_initial_data(problem, n, method="sobol"):
+    # generate training data
+    if method == "sobol":
+        train_x = draw_sobol_samples(
+            bounds=problem.bounds, n=1, q=n, seed=torch.randint(1000000, (1,)).item()
+        ).squeeze(0)
+        train_obj = problem(train_x)
+        train_con = -problem.evaluate_slack(train_x)
+    elif method == "rejection":
+        train_x = torch.zeros(0, 0)
+        while train_x.shape[0] < n:
+            new_x = (problem.bounds[1] - problem.bounds[0]) * torch.rand(
+                n,
+                problem.bounds.shape[-1],
+                device=problem.bounds.device,
+                dtype=problem.bounds.dtype,
+            ) + problem.bounds[0]
+            new_con = -problem.evaluate_slack(new_x)
+            new_obj = problem(new_x)
+
+            # keep only feasible outcomes
+            if train_x.shape[0] <= n / 2:
+                # negative implies feasible
+                tokeep = (new_con <= 0).sum(-1) == new_con.shape[-1]
+                new_x = new_x[tokeep]
+                new_con = new_con[tokeep]
+                new_obj = new_obj[tokeep]
+
+                if tokeep.sum() > 0:
+                    if train_x.shape[0] == 0:
+                        train_x = new_x
+                        train_con = new_con
+                        train_obj = new_obj
+                    else:
+                        train_x = torch.cat((train_x, new_x), dim=0)
+                        train_con = torch.cat((train_con, new_con), dim=0)
+                        train_obj = torch.cat((train_obj, new_obj), dim=0)
+            else:
+                train_x = torch.cat((train_x, new_x), dim=0)
+                train_con = torch.cat((train_con, new_con), dim=0)
+                train_obj = torch.cat((train_obj, new_obj), dim=0)
+        train_x, train_con, train_obj = train_x[:n], train_con[:n], train_obj[:n]
+
+    # train_x = (problem.bounds[1] - problem.bounds[0]) * torch.rand(n, 6, **tkwargs) + problem.bounds[0]
+    # negative values imply feasibility in botorch
+
+    return train_x, train_obj, train_con
+
+
+def initialize_model(train_x, train_obj, train_con, bounds=None, model_type="ind"):
+    if model_type == "ind":
+        gp_class = SingleTaskGP
+    elif model_type == "mmtgp":
+        gp_class = MatheronMultiTaskGP
+    elif model_type == "mtgp":
+        gp_class = KroneckerMultiTaskGP
+
+    # define models for objective and constraint
+    train_y = torch.cat([train_obj, train_con], dim=-1)
+    model = gp_class(
+        train_x,
+        train_y,
+        outcome_transform=Standardize(m=train_y.shape[-1]),
+        input_transform=Normalize(d=train_x.shape[-1], bounds=bounds),
+    )
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    return mll, model
+
+
+def get_constrained_mc_objective(train_obj, train_con, scalarization):
+    """Initialize a ConstrainedMCObjective for qParEGO"""
+    n_obj = train_obj.shape[-1]
+    n_con = train_con.shape[-1]
+    # assume first outcomes of the model are the objectives, the rest constraints
+    def objective(Z):
+        return scalarization(Z[..., :n_obj])
+
+    constrained_obj = ConstrainedMCObjective(
+        objective=objective,
+        constraints=[
+            lambda Z, dim=dim: Z[..., dim] for dim in range(n_obj, n_obj + n_con)
+        ],  # index the constraint
+    )
+    return constrained_obj
+
+
+def optimize_qparego_and_get_observation(
+    problem, model, train_obj, train_con, sampler, tkwargs, standard_bounds, batch_size
+):
+    """Samples a set of random weights for each candidate in the batch, performs sequential greedy optimization 
+    of the qParEGO acquisition function, and returns a new candidate and observation."""
+    acq_func_list = []
+    for _ in range(batch_size):
+        # sample random weights
+        weights = sample_simplex(problem.num_objectives, **tkwargs).squeeze()
+        # construct augmented Chebyshev scalarization
+        scalarization = get_chebyshev_scalarization(weights=weights, Y=train_obj)
+        # initialize ConstrainedMCObjective
+        constrained_objective = get_constrained_mc_objective(
+            train_obj=train_obj, train_con=train_con, scalarization=scalarization
+        )
+        train_y = torch.cat([train_obj, train_con], dim=-1)
+        acq_func = qExpectedImprovement(  # pyre-ignore: [28]
+            model=model,
+            objective=constrained_objective,
+            best_f=constrained_objective(train_y).max(),
+            sampler=sampler,
+        )
+        acq_func_list.append(acq_func)
+    # optimize
+    candidates, _ = optimize_acqf_list(
+        acq_function_list=acq_func_list,
+        bounds=standard_bounds,
+        num_restarts=10,
+        raw_samples=512,  # used for intialization heuristic
+        options={"batch_limit": 5, "maxiter": 200, "init_batch_limit": 20},
+    )
+    # observe new values
+    # new_x =  unnormalize(candidates.detach(), bounds=problem.bounds)
+    new_x = candidates.detach()
+    new_obj = problem(new_x)
+    # negative values imply feasibility in botorch
+    new_con = -problem.evaluate_slack(new_x)
+    return new_x, new_obj, new_con
+
+
+def generate_problem(problem, tkwargs):
+    if problem == "c2dtlz2":
+        from botorch.test_functions.multi_objective import C2DTLZ2
+
+        d = 12
+        M = 2
+        problem = C2DTLZ2(dim=d, num_objectives=M, negate=True).to(**tkwargs)
+
+        standard_bounds = torch.zeros(2, problem.dim, **tkwargs)
+        standard_bounds[1] = 1
+    elif problem == "osy":
+        from botorch.test_functions.multi_objective import OSY
+
+        d = 6
+        M = 2
+        problem = OSY(negate=True).to(**tkwargs)
+        standard_bounds = problem.bounds
+    elif problem == "ripple":
+        from botorch.test_functions.multi_objective import SwitchRipple
+
+        d = 6
+        M = 3
+        problem = SwitchRipple(negate=True).to(**tkwargs)
+        standard_bounds = problem.bounds
+
+    return problem, standard_bounds
+
+File Path: sampling_mtgps/__init__.py
+Content:
+from .matheron_mtgp import MatheronMultiTaskGP, KroneckerMultiTaskGP
+from .matheron_lcem_mtgp import KroneckerLCEMGP, MatheronLCEMGP
+
+File Path: sampling_mtgps/linalg.py
+Content:
+import torch
+import gpytorch
+
+from gpytorch import settings, lazify
+from gpytorch.lazy import DiagLazyTensor, KroneckerProductLazyTensor, RootLazyTensor
+from gpytorch.utils.lanczos import lanczos_tridiag, lanczos_tridiag_to_diag
+
+
+def update_root_decomposition(kernel, fant_train_covar, fant_fant_covar, inv_root=None):
+    # copied over from https://github.com/cornellius-gp/gpytorch/blob/08875a1430b8b2aefbd00baca303dd4aeb3f11b9/gpytorch/models/exact_prediction_strategies.py#L102
+    # [K U; U' S] = [L 0; lower_left schur_root]
+    batch_shape = fant_train_covar.shape[:-2]
+    L = kernel.root_decomposition().root.evaluate()
+
+    if inv_root is None:
+        L_inverse = kernel.root_inv_decomposition().root.evaluate()
+    else:
+        L_inverse = inv_root.root.evaluate()
+
+    m, n = L.shape[-2:]
+
+    lower_left = fant_train_covar.matmul(L_inverse)
+    schur = fant_fant_covar - lower_left.matmul(lower_left.transpose(-2, -1))
+    schur_root = schur.root_decomposition().root.evaluate()
+
+    # Form new root Z = [L 0; lower_left schur_root]
+    num_fant = schur_root.size(-2)
+    new_root = torch.zeros(
+        *batch_shape, m + num_fant, n + num_fant, device=L.device, dtype=L.dtype
+    )
+    new_root[..., :m, :n] = L
+    new_root[..., m:, : lower_left.shape[-1]] = lower_left
+    new_root[..., m:, n : (n + schur_root.shape[-1])] = schur_root
+    return new_root
+
+
+def diagonalize(lazy_tensor):
+    if lazy_tensor.shape[-1] >= settings.max_cholesky_size.value():
+        qmat, tmat = lanczos_tridiag(
+            lazy_tensor.matmul,
+            max_iter=settings.max_root_decomposition_size.value(),
+            dtype=lazy_tensor.dtype,
+            device=lazy_tensor.device,
+            matrix_shape=lazy_tensor.shape[-2:],
+            batch_shape=lazy_tensor.batch_shape,
+        )
+        evals, q_t = lanczos_tridiag_to_diag(tmat)
+        evecs = qmat @ q_t
+        npad = evecs.shape[-2] - evecs.shape[-1]
+
+        full_evecs = torch.cat(
+            (
+                evecs,
+                torch.zeros(
+                    *lazy_tensor.batch_shape,
+                    evecs.shape[-2],
+                    npad,
+                    device=evecs.device,
+                    dtype=evecs.dtype
+                ),
+            ),
+            dim=-1,
+        )
+        full_evals = torch.cat(
+            (
+                evals,
+                torch.zeros(
+                    *lazy_tensor.batch_shape, npad, device=evecs.device, dtype=evecs.dtype
+                ),
+            )
+        )
+
+    else:
+        evals, evecs = lazy_tensor.symeig(eigenvectors=True)
+
+        full_evals = evals
+        full_evecs = evecs
+
+    return evals, evecs, full_evals, full_evecs
+
+File Path: sampling_mtgps/matheron_lcem_mtgp.py
+Content:
+from typing import Any, List, Optional, Union, Tuple
+
+import torch
+import math
+
+from gpytorch.kernels import ScaleKernel, MultitaskKernel, MaternKernel, RBFKernel, Kernel
+from gpytorch.kernels.keops import MaternKernel as KMaternKernel
+from gpytorch.likelihoods import MultitaskGaussianLikelihood
+from gpytorch.distributions import MultitaskMultivariateNormal
+from gpytorch.constraints import GreaterThan, Interval
+from botorch.posteriors import GPyTorchPosterior
+from gpytorch.lazy import KroneckerProductLazyTensor, LazyTensor, lazify
+from gpytorch.priors import GammaPrior, Prior
+from botorch.models.transforms.input import InputTransform
+from botorch.models.transforms.outcome import OutcomeTransform
+from copy import deepcopy
+from torch.nn import ModuleList
+from torch import Tensor
+
+from .matheron_mtgp import KroneckerMultiTaskGP, MatheronMultiTaskGP
+
+
+class EmbeddingMultitaskKernel(MultitaskKernel):
+    def __init__(
+        self,
+        num_tasks: int,
+        data_covar_module: Kernel = None,
+        task_covar_module: Kernel = None,
+        task_covar_prior: Prior = None,
+        context_cat_feature: Optional[Tensor] = None,
+        context_emb_feature: Optional[Tensor] = None,
+        embs_dim_list: Optional[List[int]] = None,
+        **kwargs
+    ) -> None:
+        if data_covar_module is None:
+            data_covar_module = ScaleKernel(
+                base_kernel=MaternKernel(
+                    nu=2.5, ard_num_dims=1, lengthscale_prior=GammaPrior(3.0, 6.0)
+                ),
+                outputscale_prior=GammaPrior(2.0, 0.15),
+            )
+        super(EmbeddingMultitaskKernel, self).__init__(
+            num_tasks=num_tasks,
+            rank=num_tasks,
+            data_covar_module=data_covar_module,
+            task_covar_prior=task_covar_prior,
+            **kwargs,
+        )
+
+        if context_cat_feature is None:
+            context_cat_feature = torch.arange(num_tasks).long().unsqueeze(-1)
+        self.context_cat_feature = context_cat_feature  # row indices = context indices
+        self.context_emb_feature = context_emb_feature
+        #  construct emb_dims based on categorical features
+        if embs_dim_list is None:
+            #  set embedding_dim = 1 for each categorical variable
+            embs_dim_list = [1 for _i in range(context_cat_feature.size(1))]
+        n_embs = sum(embs_dim_list)
+        self.emb_dims = [
+            (len(context_cat_feature[:, i].unique()), embs_dim_list[i])
+            for i in range(context_cat_feature.size(1))
+        ]
+        # contruct embedding layer: need to handle multiple categorical features
+        self.emb_layers = ModuleList(
+            [
+                torch.nn.Embedding(num_embeddings=x, embedding_dim=y, max_norm=1.0)
+                for x, y in self.emb_dims
+            ]
+        )
+        self.task_covar_module = RBFKernel(
+            ard_num_dims=n_embs,
+            lengthscale_constraint=Interval(0.0, 2.0, transform=None, initial_value=1.0),
+        )
+
+    def eval_context_covar(self) -> LazyTensor:
+        """obtain context covariance matrix (num_contexts x num_contexts)"""
+        all_embs = self._task_embeddings()
+        return self.task_covar_module(all_embs)
+
+    def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
+        if last_dim_is_batch:
+            raise RuntimeError(
+                "MultitaskKernel does not accept the last_dim_is_batch argument."
+            )
+        covar_i = self.eval_context_covar()
+
+        if len(x1.shape[:-2]):
+            covar_i = covar_i.repeat(*x1.shape[:-2], 1, 1)
+        covar_x = lazify(self.data_covar_module.forward(x1, x2, **params))
+        res = KroneckerProductLazyTensor(covar_x, covar_i)
+        return res.diag() if diag else res
+
+    def _task_embeddings(self) -> Tensor:
+        """generate embedding features for all contexts."""
+        embeddings = [
+            emb_layer(self.context_cat_feature[:, i].to(dtype=torch.long))  # pyre-ignore
+            for i, emb_layer in enumerate(self.emb_layers)
+        ]
+        embeddings = torch.cat(embeddings, dim=1)
+
+        # add given embeddings if any
+        if self.context_emb_feature is not None:
+            embeddings = torch.cat(
+                [embeddings, self.context_emb_feature], dim=1  # pyre-ignore
+            )
+        return embeddings
+
+
+class KroneckerLCEMGP(KroneckerMultiTaskGP):
+    r"""
+    A block structured ICM multitask gp model with a Matheron posterior.
+    Each task has its own latent embedding dimension as in 
+    https://github.com/pytorch/botorch/blob/master/botorch/models/contextual_multioutput.py
+
+    """
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        likelihood: MultitaskGaussianLikelihood = None,
+        task_covar_prior: Optional[Prior] = None,
+        output_tasks: Optional[List[int]] = None,
+        input_transform: Optional[InputTransform] = None,
+        outcome_transform: Optional[OutcomeTransform] = None,
+        use_keops=False,
+        context_cat_feature: Optional[Tensor] = None,
+        context_emb_feature: Optional[Tensor] = None,
+        embs_dim_list: Optional[List[int]] = None,
+    ) -> None:
+
+        super(KroneckerLCEMGP, self).__init__(
+            train_X=train_X,
+            train_Y=train_Y,
+            likelihood=likelihood,
+            output_tasks=output_tasks,
+            rank=None,
+            input_transform=input_transform,
+            outcome_transform=outcome_transform,
+        )
+        kernel_fn = KMaternKernel if use_keops else MaternKernel
+        ard_num_dims = train_X.shape[-1]
+        batch_shape = train_X.shape[:-2]
+
+        if context_cat_feature is None:
+            context_cat_feature = (
+                torch.arange(self._num_outputs).to(train_X).long().unsqueeze(-1)
+            )
+
+        self.covar_module = EmbeddingMultitaskKernel(
+            data_covar_module=ScaleKernel(
+                kernel_fn(
+                    nu=2.5,
+                    ard_num_dims=ard_num_dims,
+                    lengthscale_prior=GammaPrior(3.0, 6.0),
+                    batch_shape=batch_shape,
+                ),
+                outputscale_prior=GammaPrior(2.0, 0.15),
+                batch_shape=batch_shape,
+            ),
+            num_tasks=self._num_outputs,
+            batch_shape=batch_shape,
+            context_cat_feature=context_cat_feature,
+            context_emb_feature=context_emb_feature,
+            embs_dim_list=embs_dim_list,
+        )
+
+        self.to(train_X)
+
+
+class MatheronLCEMGP(MatheronMultiTaskGP, KroneckerLCEMGP):
+    def __init__(self, *args, **kwargs):
+        KroneckerLCEMGP.__init__(self, *args, **kwargs)
+
+    def _task_covar_matrix(self) -> LazyTensor:
+        return self.covar_module.eval_context_covar()
+
+File Path: sampling_mtgps/matheron_mtgp.py
+Content:
+from typing import Any, List, Optional, Union, Tuple
+
+import torch
+import math
+
+from botorch.models.gpytorch import GPyTorchModel
+from gpytorch.kernels import MultitaskKernel, MaternKernel, IndexKernel
+from gpytorch.kernels.keops import MaternKernel as KMaternKernel
+from gpytorch.likelihoods import MultitaskGaussianLikelihood
+from gpytorch.distributions import MultitaskMultivariateNormal
+from gpytorch.constraints import GreaterThan, Interval
+from botorch.posteriors import GPyTorchPosterior
+from gpytorch.utils.memoize import cached, pop_from_cache
+from gpytorch.utils.errors import CachingError
+from gpytorch.lazy import (
+    BatchRepeatLazyTensor,
+    RootLazyTensor,
+    lazify,
+    DiagLazyTensor,
+    KroneckerProductLazyTensor,
+)
+from gpytorch.means import ConstantMean, MultitaskMean
+from gpytorch.models import ExactGP
+from gpytorch.settings import cholesky_jitter
+from gpytorch.priors import (
+    GammaPrior,
+    Prior,
+    LKJCovariancePrior,
+    HorseshoePrior,
+    SmoothedBoxPrior,
+)
+from botorch.models.transforms.input import InputTransform
+from botorch.models.transforms.outcome import OutcomeTransform
+from copy import deepcopy
+
+from torch import Tensor
+
+from .linalg import diagonalize, update_root_decomposition
+from .matheron_posterior import MatheronPosterior
+
+
+class KroneckerMultiTaskGP(ExactGP, GPyTorchModel):
+    r"""
+    This multi task GP is more like the multi task gp in 
+    https://github.com/cornellius-gp/gpytorch/blob/master/examples/03_Multitask_Exact_GPs/Multitask_GP_Regression.ipynb
+    rather than the multi task GP implemented in botorch.models.MultiTaskGP, due to not
+    having explicit task indices.
+
+    TODO: replace with botorch PR #637
+    """
+
+    def __init__(
+        self,
+        train_X: Tensor,
+        train_Y: Tensor,
+        # num_tasks: int,
+        likelihood: MultitaskGaussianLikelihood = None,
+        task_covar_prior: Optional[Prior] = None,
+        output_tasks: Optional[List[int]] = None,
+        rank: Optional[int] = None,
+        lik_rank: Optional[int] = None,
+        input_transform: Optional[InputTransform] = None,
+        outcome_transform: Optional[OutcomeTransform] = None,
+        use_keops=False,
+        eta: float = 2.0,
+        has_second_noise: bool = False,
+    ) -> None:
+
+        num_tasks = train_Y.shape[-1]
+        batch_shape, ard_num_dims = train_X.shape[:-2], train_X.shape[-1]
+
+        if lik_rank is None:
+            lik_rank = rank
+
+        if input_transform is not None:
+            input_transform.to(train_X)
+        with torch.no_grad():
+            transformed_X = self.transform_inputs(
+                X=train_X, input_transform=input_transform
+            )
+        if outcome_transform is not None:
+            train_Y, _ = outcome_transform(train_Y)
+
+        self._validate_tensor_args(X=transformed_X, Y=train_Y)
+
+        if likelihood is None:
+            likelihood = MultitaskGaussianLikelihood(
+                num_tasks=num_tasks,
+                rank=lik_rank if lik_rank is not None else 0,
+                noise_prior=HorseshoePrior(0.1),
+                noise_constraint=Interval(1e-6, 4.0),
+                has_global_noise=has_second_noise,
+            )
+
+        super(KroneckerMultiTaskGP, self).__init__(train_X, train_Y, likelihood)
+        kernel_fn = KMaternKernel if use_keops else MaternKernel
+        self._rank = rank if rank is not None else num_tasks
+        self._num_outputs = num_tasks
+        self.covar_module = MultitaskKernel(
+            data_covar_module=kernel_fn(
+                nu=2.5,
+                ard_num_dims=ard_num_dims,
+                lengthscale_prior=GammaPrior(2.0, 5.0),
+                lengthscale_constraint=Interval(0.005, 100.0),
+                batch_shape=batch_shape,
+            ),
+            num_tasks=num_tasks,
+            rank=self._rank,
+            batch_shape=batch_shape,
+            task_covar_prior=LKJCovariancePrior(
+                n=num_tasks,
+                eta=eta,
+                sd_prior=SmoothedBoxPrior(math.exp(-6), math.exp(1.25), 0.05),
+            ),
+        )
+
+        self.mean_module = MultitaskMean(ConstantMean(), num_tasks=num_tasks)
+
+        if outcome_transform is not None:
+            self.outcome_transform = outcome_transform
+        if input_transform is not None:
+            self.input_transform = input_transform
+        self.to(train_X)
+
+    def forward(self, x: Tensor) -> MultitaskMultivariateNormal:
+        x = self.transform_inputs(x)
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x).evaluate_kernel()
+        return MultitaskMultivariateNormal(mean_x, covar_x)
+
+
+class MatheronMultiTaskGP(KroneckerMultiTaskGP):
+    r"""
+        A multi task gp class with a Matheron's rule sampled posterior instead of the 
+        standard multi task posterior.
+    """
+
+    def _task_covar_matrix(self):
+        return self.covar_module.task_covar_module.covar_matrix
+
+    @property
+    @cached(name="task_root")
+    def task_root(self):
+        task_covar = self._task_covar_matrix().detach()
+
+        # construct MM' \approx Ktt
+        task_evals, task_evecs, _, _ = diagonalize(task_covar)
+        task_root = task_evecs.matmul(task_evals.clamp(1e-7).diag_embed().sqrt())
+        return task_root
+
+    @property
+    @cached(name="train_full_covar")
+    def train_full_covar(self):
+        train_x = self.transform_inputs(self.train_inputs[0])
+
+        # construct Kxx \otimes Ktt
+        train_full_covar = self.covar_module(train_x).evaluate_kernel().detach()
+        return train_full_covar
+
+    @property
+    @cached(name="data_data_roots")
+    def data_data_roots(self):
+
+        # construct Kxx \otimes Ktt
+        train_full_covar = self.train_full_covar
+
+        # construct Kxx
+        data_data_covar = train_full_covar.lazy_tensors[0]
+
+        # construct RR' \approx Kxx
+        dd_evals, dd_evecs, _, _ = diagonalize(data_data_covar)
+        q_t_root = dd_evecs.matmul(dd_evals.diag_embed().clamp(1e-7).sqrt())
+        q_t_inv_root = dd_evecs.matmul((1.0 / dd_evals.clamp(1e-7).sqrt()).diag_embed())
+        return q_t_root, q_t_inv_root
+
+    def posterior(
+        self,
+        X: Tensor,
+        output_indices: Optional[List[int]] = None,
+        observation_noise: Union[bool, Tensor] = False,
+        **kwargs: Any,
+    ) -> GPyTorchPosterior:
+        self.eval()
+
+        X = self.transform_inputs(X)
+        train_x = self.transform_inputs(self.train_inputs[0])
+
+        ## construct Ktt
+        task_covar = self._task_covar_matrix().detach()
+        task_root = self.task_root
+        if task_covar.batch_shape != X.shape[:-2]:
+            task_covar = BatchRepeatLazyTensor(task_covar, batch_repeat=X.shape[:-2])
+            task_root = BatchRepeatLazyTensor(
+                lazify(task_root), batch_repeat=X.shape[:-2]
+            )
+
+        task_covar_rootlt = RootLazyTensor(task_root)
+
+        ## construct RR' \approx Kxx
+        q_t_root, q_t_inv_root = self.data_data_roots
+        data_data_root = RootLazyTensor(q_t_root)
+        data_data_inv_root = RootLazyTensor(q_t_inv_root)
+
+        # construct K_{xt, x}
+        test_data_covar = self.covar_module.data_covar_module(X, train_x)
+        # construct K_{xt, xt}
+        test_test_covar = self.covar_module.data_covar_module(X)
+
+        # now update root so that \tilde{R}\tilde{R}' \approx K_{(x,xt), (x,xt)}
+        # cloning preserves the gradient history or something
+        with cholesky_jitter(1e-7):
+            updated_root = update_root_decomposition(
+                data_data_root,
+                test_data_covar.clone(),
+                test_test_covar,
+                inv_root=data_data_inv_root,
+            )
+
+        # build a root decomposition of the joint train/test covariance matrix
+        # construct (\tilde{R} \otimes M)(\tilde{R} \otimes M)' \approx (K_{(x,xt), (x,xt)} \otimes Ktt)
+        joint_covar = RootLazyTensor(
+            KroneckerProductLazyTensor(updated_root, task_covar_rootlt.root.detach())
+        )
+
+        # construct K_{xt, x} \otimes Ktt
+        test_obs_kernel = KroneckerProductLazyTensor(test_data_covar, task_covar)
+
+        # collect y - \mu(x) and \mu(X)
+        train_diff = self.train_targets - self.mean_module(train_x)
+        test_mean = self.mean_module(X)
+
+        train_noise = self.likelihood._shaped_noise_covar(train_x.shape).detach()
+
+        posterior = MatheronPosterior(
+            joint_covariance=joint_covar,
+            test_obs_kernel=test_obs_kernel,
+            train_diff=train_diff.detach(),
+            test_mean=test_mean,
+            train_train_covar=self.train_full_covar,
+            train_noise=train_noise,
+        )
+
+        if hasattr(self, "outcome_transform"):
+            posterior = self.outcome_transform.untransform_posterior(posterior)
+
+        return posterior
+
+    def train(self, val=True, *args, **kwargs):
+        if val:
+            fixed_cache_names = ["data_data_roots", "train_full_covar", "task_root"]
+            for name in fixed_cache_names:
+                try:
+                    pop_from_cache(self, name)
+                except CachingError:
+                    pass
+
+        return super().train(val, *args, **kwargs)
+
+File Path: sampling_mtgps/matheron_posterior.py
+Content:
+from typing import Any, List, Optional, Union, Tuple
+
+import torch
+
+from botorch.posteriors import Posterior
+from torch import Tensor
+
+
+class MatheronPosterior(Posterior):
+    def __init__(
+        self,
+        joint_covariance,
+        test_obs_kernel,
+        train_diff,
+        test_mean,
+        train_train_covar,
+        train_noise,
+    ):
+        super().__init__()
+        self._is_mt = True
+
+        self.joint_covariance = joint_covariance
+        self.test_obs_kernel = test_obs_kernel
+        self.train_diff = train_diff
+        self.test_mean = test_mean
+        self.train_train_covar = train_train_covar
+        self.train_noise = train_noise
+
+        self.num_train = self.train_diff.shape[-2]
+        self.num_tasks = self.test_obs_kernel.lazy_tensors[-1].shape[-1]
+
+    @property
+    def event_shape(self):
+        # overwrites the standard event_shape call to inform samplers that
+        # n + 2 n_train samples need to be drawn rather than n samples
+        # TODO: Expose a sample shape property that is independent of the event shape
+        # and handle those transparently in the samplers.
+        batch_shape = self.joint_covariance.shape[:-2]
+        sampling_shape = self.joint_covariance.shape[-2] + self.train_noise.shape[-2]
+        return batch_shape + torch.Size((sampling_shape,))
+
+    @property
+    def device(self) -> torch.device:
+        r"""The torch device of the posterior."""
+        return self.test_mean.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        r"""The torch dtype of the posterior."""
+        return self.test_mean.dtype
+
+    def _prepare_base_samples(
+        self, sample_shape: torch.Size, base_samples: Tensor = None
+    ) -> Tensor:
+        covariance_matrix = self.joint_covariance
+        joint_size = covariance_matrix.shape[-1]
+        batch_shape = covariance_matrix.batch_shape
+
+        if base_samples is not None:
+            if base_samples.shape[: len(sample_shape)] != sample_shape:
+                raise RuntimeError("sample_shape disagrees with shape of base_samples.")
+
+            if base_samples.shape[-1] != 1:
+                base_samples = base_samples.unsqueeze(-1)
+            unsqueezed_dim = -2
+
+            appended_shape = joint_size + self.train_train_covar.shape[-1]
+            if appended_shape != base_samples.shape[unsqueezed_dim]:
+                # get base_samples to the correct shape by expanding as sample shape,
+                # batch shape, then rest of dimensions. We have to add first the sample
+                # shape, then the batch shape of the model, and then finally the shape
+                # of the test data points squeezed into a single dimension, accessed
+                # from the test_train_covar.
+                base_sample_shapes = (
+                    sample_shape + batch_shape + self.test_obs_kernel.shape[-2:-1]
+                )
+                if base_samples.nelement() == base_sample_shapes.numel():
+                    base_samples = base_samples.reshape(base_sample_shapes)
+
+                    new_base_samples = torch.randn(
+                        sample_shape
+                        + batch_shape
+                        + torch.Size((appended_shape - base_samples.shape[-1],))
+                    )
+                    base_samples = torch.cat((base_samples, new_base_samples), dim=-1)
+
+                    base_samples = base_samples.unsqueeze(-1)
+                else:
+                    # nuke the base samples if we cannot use them.
+                    base_samples = None
+
+        if base_samples is None:
+            # TODO: Allow qMC sampling
+            base_samples = torch.randn(
+                *sample_shape,
+                *batch_shape,
+                joint_size,
+                1,
+                device=covariance_matrix.device,
+                dtype=covariance_matrix.dtype,
+            )
+
+            noise_base_samples = torch.randn(
+                *sample_shape,
+                *batch_shape,
+                self.train_train_covar.shape[-1],
+                1,
+                device=covariance_matrix.device,
+                dtype=covariance_matrix.dtype,
+            )
+        else:
+            # finally split up the base samples
+            noise_base_samples = base_samples[..., joint_size:, :]
+            base_samples = base_samples[..., :joint_size, :]
+
+        return base_samples, noise_base_samples
+
+    def rsample(
+        self,
+        sample_shape: Optional[torch.Size] = None,
+        base_samples: Optional[Tensor] = None,
+        train_diff: Optional[Tensor] = None,
+    ) -> Tensor:
+
+        if train_diff is None:
+            train_diff = self.train_diff
+
+        base_samples, noise_base_samples = self._prepare_base_samples(
+            sample_shape=sample_shape, base_samples=base_samples
+        )
+        joint_samples = self._draw_from_base_covar(self.joint_covariance, base_samples)
+        noise_samples = self._draw_from_base_covar(self.train_noise, noise_base_samples)
+
+        # pluck out the train + test samples and add the likelihood's noise to the train side
+        obs_samples = joint_samples[..., : (self.num_tasks * self.num_train)]
+        updated_obs_samples = obs_samples + noise_samples
+        test_samples = joint_samples[..., (self.num_tasks * self.num_train) :]
+
+        obs_minus_samples = (
+            train_diff.reshape(*train_diff.shape[:-2], -1) - updated_obs_samples
+        )
+        train_covar_plus_noise = self.train_train_covar + self.train_noise
+        obs_solve = train_covar_plus_noise.inv_matmul(obs_minus_samples.unsqueeze(-1))
+
+        # and multiply the test-observed matrix against the result of the solve
+        updated_samples = self.test_obs_kernel.matmul(obs_solve).squeeze(-1)
+
+        # finally, we add the conditioned samples to the prior samples
+        final_samples = test_samples + updated_samples
+
+        # and reshape
+        final_samples = final_samples.reshape(
+            *final_samples.shape[:-1], self.test_mean.shape[-2], self.num_tasks
+        )
+        final_samples = final_samples + self.test_mean
+        return final_samples
+
+    def _draw_from_base_covar(self, covar, base_samples):
+        # Now reparameterize those base samples
+        covar_root = covar.root_decomposition().root
+        # If necessary, adjust base_samples for rank of root decomposition
+        if covar_root.shape[-1] < base_samples.shape[-2]:
+            base_samples = base_samples[..., : covar_root.shape[-1], :]
+        elif covar_root.shape[-1] > base_samples.shape[-2]:
+            raise RuntimeError("Incompatible dimension of `base_samples`")
+        res = covar_root.matmul(base_samples)
+
+        return res.squeeze(-1)
+
+File Path: setup.py
+Content:
+from setuptools import find_packages, setup
+
+setup(
+    name="sampling_mtgps",
+    version="0.0.1",
+    packages=find_packages(),
+    install_requires=["gpytorch", "botorch"],
+)
+
+Output:
+{
+    "experimental_code": "from typing import Any, List, Optional, Union, Tuple\n\nimport torch\nimport math\n\nfrom botorch.models.gpytorch import GPyTorchModel\nfrom gpytorch.kernels import MultitaskKernel, MaternKernel, IndexKernel\nfrom gpytorch.kernels.keops import MaternKernel as KMaternKernel\nfrom gpytorch.likelihoods import MultitaskGaussianLikelihood\nfrom gpytorch.distributions import MultitaskMultivariateNormal\nfrom gpytorch.constraints import GreaterThan, Interval\nfrom botorch.posteriors import GPyTorchPosterior\nfrom gpytorch.utils.memoize import cached, pop_from_cache\nfrom gpytorch.utils.errors import CachingError\nfrom gpytorch.lazy import (\n    BatchRepeatLazyTensor,\n    RootLazyTensor,\n    lazify,\n    DiagLazyTensor,\n    KroneckerProductLazyTensor,\n)\nfrom gpytorch.means import ConstantMean, MultitaskMean\nfrom gpytorch.models import ExactGP\nfrom gpytorch.settings import cholesky_jitter\nfrom gpytorch.priors import (\n    GammaPrior,\n    Prior,\n    LKJCovariancePrior,\n    HorseshoePrior,\n    SmoothedBoxPrior,\n)\nfrom botorch.models.transforms.input import InputTransform\nfrom botorch.models.transforms.outcome import OutcomeTransform\nfrom copy import deepcopy\n\nfrom torch import Tensor\n\nfrom .linalg import diagonalize, update_root_decomposition\nfrom .matheron_posterior import MatheronPosterior\n\n\nclass KroneckerMultiTaskGP(ExactGP, GPyTorchModel):\n    r\"\"\"\n    This multi task GP is more like the multi task gp in \n    https://github.com/cornellius-gp/gpytorch/blob/master/examples/03_Multitask_Exact_GPs/Multitask_GP_Regression.ipynb\n    rather than the multi task GP implemented in botorch.models.MultiTaskGP, due to not\n    having explicit task indices.\n\n    TODO: replace with botorch PR #637\n    \"\"\"\n\n    def __init__(\n        self,\n        train_X: Tensor,\n        train_Y: Tensor,\n        # num_tasks: int,\n        likelihood: MultitaskGaussianLikelihood = None,\n        task_covar_prior: Optional[Prior] = None,\n        output_tasks: Optional[List[int]] = None,\n        rank: Optional[int] = None,\n        lik_rank: Optional[int] = None,\n        input_transform: Optional[InputTransform] = None,\n        outcome_transform: Optional[OutcomeTransform] = None,\n        use_keops=False,\n        eta: float = 2.0,\n        has_second_noise: bool = False,\n    ) -> None:\n\n        num_tasks = train_Y.shape[-1]\n        batch_shape, ard_num_dims = train_X.shape[:-2], train_X.shape[-1]\n\n        if lik_rank is None:\n            lik_rank = rank\n\n        if input_transform is not None:\n            input_transform.to(train_X)\n        with torch.no_grad():\n            transformed_X = self.transform_inputs(\n                X=train_X, input_transform=input_transform\n            )\n        if outcome_transform is not None:\n            train_Y, _ = outcome_transform(train_Y)\n\n        self._validate_tensor_args(X=transformed_X, Y=train_Y)\n\n        if likelihood === None:\n            likelihood = MultitaskGaussianLikelihood(\n                num_tasks=num_tasks,\n                rank=lik_rank if lik_rank is not None else 0,\n                noise_prior=HorseshoePrior(0.1),\n                noise_constraint=Interval(1e-6, 4.0),\n                has_global_noise=has_second_noise,\n            )\n\n        super(KroneckerMultiTaskGP, self).__init__(train_X, train_Y, likelihood)\n        kernel_fn = KMaternKernel if use_keops else MaternKernel\n        self._rank = rank if rank is not None else num_tasks\n        self._num_outputs = num_tasks\n        self.covar_module = MultitaskKernel(\n            data_covar_module=kernel_fn(\n                nu=2.5,\n                ard_num_dims=ard_num_dims,\n                lengthscale_prior=GammaPrior(2.0, 5.0),\n                lengthscale_constraint=Interval(0.005, 100.0),\n                batch_shape=batch_shape,\n            ),\n            num_tasks=num_tasks,\n            rank=self._rank,\n            batch_shape=batch_shape,\n            task_covar_prior=LKJCovariancePrior(\n                n=num_tasks,\n                eta=eta,\n                sd_prior=SmoothedBoxPrior(math.exp(-6), math.exp(1.25), 0.05),\n            ),\n        )\n\n        self.mean_module = MultitaskMean(ConstantMean(), num_tasks=num_tasks)\n\n        if outcome_transform is not None:\n            self.outcome_transform = outcome_transform\n        if input_transform is not None:\n            self.input_transform = input_transform\n        self.to(train_X)\n\n    def forward(self, x: Tensor) -> MultitaskMultivariateNormal:\n        x = self.transform_inputs(x)\n        mean_x = self.mean_module(x)\n        covar_x = self.covar_module(x).evaluate_kernel()\n        return MultitaskMultivariateNormal(mean_x, covar_x)\n\n\nclass MatheronMultiTaskGP(KroneckerMultiTaskGP):\n    r\"\"\"\n        A multi task gp class with a Matheron's rule sampled posterior instead of the \n        standard multi task posterior.\n    \"\"\"\n\n    def _task_covar_matrix(self):\n        return self.covar_module.task_covar_module.covar_matrix\n\n    @property\n    @cached(name=\"task_root\")\n    def task_root(self):\n        task_covar = self._task_covar_matrix().detach()\n\n        # construct MM' \\approx Ktt\n        task_evals, task_evecs, _, _ = diagonalize(task_covar)\n        task_root = task_evecs.matmul(task_evals.clamp(1e-7).diag_embed().sqrt())\n        return task_root\n\n    @property\n    @cached(name=\"train_full_covar\")\n    def train_full_covar(self):\n        train_x = self.transform_inputs(self.train_inputs[0])\n\n        # construct Kxx \\otimes Ktt\n        train_full_covar = self.covar_module(train_x).evaluate_kernel().detach()\n        return train_full_covar\n\n    @property\n    @cached(name=\"data_data_roots\")\n    def data_data_roots(self):\n\n        # construct Kxx \\otimes Ktt\n        train_full_covar = self.train_full_covar\n\n        # construct Kxx\n        data_data_covar = train_full_covar.lazy_tensors[0]\n\n        # construct RR' \\approx Kxx\n        dd_evals, dd_evecs, _, _ = diagonalize(data_data_covar)\n        q_t_root = dd_evecs.matmul(dd_evals.diag_embed().clamp(1e-7).sqrt())\n        q_t_inv_root = dd_evecs.matmul((1.0 / dd_evals.clamp(1e-7).sqrt()).diag_embed())\n        return q_t_root, q_t_inv_root\n\n    def posterior(\n        self,\n        X: Tensor,\n        output_indices: Optional[List[int]] = None,\n        observation_noise: Union[bool, Tensor] = False,\n        **kwargs: Any,\n    ) -> GPyTorchPosterior:\n        self.eval()\n\n        X = self.transform_inputs(X)\n        train_x = self.transform_inputs(self.train_inputs[0])\n\n        ## construct Ktt\n        task_covar = self._task_covar_matrix().detach()\n        task_root = self.task_root\n        if task_covar.batch_shape != X.shape[:-2]:\n            task_covar = BatchRepeatLazyTensor(task_covar, batch_repeat=X.shape[:-2])\n            task_root = BatchRepeatLazyTensor(\n                lazify(task_root), batch_repeat=X.shape[:-2]\n            )\n\n        task_covar_rootlt = RootLazyTensor(task_root)\n\n        ## construct RR' \\approx Kxx\n        q_t_root, q_t_inv_root = self.data_data_roots\n        data_data_root = RootLazyTensor(q_t_root)\n        data_data_inv_root = RootLazyTensor(q_t_inv_root)\n\n        # construct K_{xt, x}\n        test_data_covar = self.covar_module.data_covar_module(X, train_x)\n        # construct K_{xt, xt}\n        test_test_covar = self.covar_module.data_covar_module(X)\n\n        # now update root so that \\tilde{R}\\tilde{R}' \\approx K_{(x,xt), (x,xt)}\n        # cloning preserves the gradient history or something\n        with cholesky_jitter(1e-7):\n            updated_root = update_root_decomposition(\n                data_data_root,\n                test_data_covar.clone(),\n                test_test_covar,\n                inv_root=data_data_inv_root,\n            )\n\n        # build a root decomposition of the joint train/test covariance matrix\n        # construct (\\tilde{R} \\otimes M)(\\tilde{R} \\otimes M)' \\approx (K_{(x,xt), (x,xt)} \\otimes Ktt)\n        joint_covar = RootLazyTensor(\n            KroneckerProductLazyTensor(updated_root, task_covar_rootlt.root.detach())\n        )\n\n        # construct K_{xt, x} \\otimes Ktt\n        test_obs_kernel = KroneckerProductLazyTensor(test_data_covar, task_covar)\n\n        # collect y - \\mu(x) and \\mu(X)\n        train_diff = self.train_targets - self.mean_module(train_x)\n        test_mean = self.mean_module(X)\n\n        train_noise = self.likelihood._shaped_noise_covar(train_x.shape).detach()\n\n        posterior = MatheronPosterior(\n            joint_covariance=joint_covar,\n            test_obs_kernel=test_obs_kernel,\n            train_diff=train_diff.detach(),\n            test_mean=test_mean,\n            train_train_covar=self.train_full_covar,\n            train_noise=train_noise,\n        )\n\n        if hasattr(self, \"outcome_transform\"):\n            posterior = self.outcome_transform.untransform_posterior(posterior)\n\n        return posterior\n\n    def train(self, val=True, *args, **kwargs):\n        if val:\n            fixed_cache_names = [\"data_data_roots\", \"train_full_covar\", \"task_root\"]\n            for name in fixed_cache_names:\n                try:\n                    pop_from_cache(self, name)\n                except CachingError:\n                    pass\n\n        return super().train(val, *args, **kwargs)",
+    "experimental_info": "Multi-Task GP (MTGP) models for Matheron's rule sampling and Kronecker structure were evaluated using the following experimental settings across different scenarios:\n\n1.  **Contextual Bayesian Optimization Experiments (Files: `contextualbo_experiments/cbo_experiment.py`, `contextualbo_experiments/contextual_full.py`):**\n    *   **Seed:** 0\n    *   **Device:** 'cuda' (falls back to 'cpu' if unavailable)\n    *   **Output File:** 'results.pt'\n    *   **Problem:** 'Branin2D' (default), choices include 'Branin2D', 'Hartmann6D', 'Branin1DEmbedding', 'Hartmann5DEmbedding'\n    *   **Number of Batches (`n_batch`):** 50\n    *   **Number of Contexts:** 10\n    *   **Monte Carlo Samples (`mc_samples`):** 128 (default in `parse`), 64 (in `main` function call)\n    *   **Batch Size:** 2\n    *   **Number of Initial Points (`n_init`):** 10\n    *   **Models Evaluated:**\n        *   `LCEMGP` (baseline)\n        *   `MatheronLCEMGP` (Matheron's rule with LCEMGP structure)\n        *   `KroneckerLCEMGP` (Kronecker structure with LCEMGP, only in `contextual_full.py`)\n    *   **Likelihood:** `MultitaskGaussianLikelihood(rank=0, num_tasks=contexts, noise_prior=GammaPrior(1.1, 0.05), has_global_noise=True, has_task_noise=False)`\n    *   **Acquisition Function:** `qExpectedImprovement` with `IIDNormalSampler`\n    *   **Optimization:** `optimize_acqf` with `num_restarts=10`, `raw_samples=256` (`512` in `contextual_full.py`), `options={'batch_limit': 5, 'maxiter': 200, 'init_batch_limit': 5}`\n    *   **Model Fitting:** `fit_gpytorch_torch` with `maxiter=250`\n\n2.  **Posterior Timing Experiments (File: `contextualbo_experiments/post_timing.py`):**\n    *   **Seed:** 0\n    *   **Device:** 'cuda' (falls back to 'cpu' if unavailable)\n    *   **Output File:** 'results.pt'\n    *   **Problem:** 'Hartmann5DEmbedding' (default), choices include 'Branin2D', 'Hartmann6D', 'Branin1DEmbedding', 'Hartmann5DEmbedding'\n    *   **Number of Contexts:** 10\n    *   **LOVE (Low-rank Off-diagonal Variance Estimation):** Controlled by `love` argument. When `love` is true, `max_cholesky_size` is 4, otherwise 5000.\n    *   **Number of Initial Points (`n_init`):** 100\n    *   **Maximum Number of Test Points (`nt_max`):** 310; `ntest_setup` points for timing are `torch.arange(5, nt_max, 25)`\n    *   **Models Evaluated:** `KroneckerMultiTaskGP`, `FixedNoiseMultiTaskGP`, `MatheronMultiTaskGP`\n    *   **Posterior Samples for Timing:** 256\n    *   **Model Fitting:** `fit_gpytorch_torch` with `maxiter=25`\n    *   **Memory Limit:** Soft limit 20GB, Hard limit 28GB\n\n3.  **Multi-Objective Bayesian Optimization Experiments (Files: `mtgp_experiments/constrained_mobo.py`, `mtgp_experiments/mobo_utils.py`):**\n    *   **Seed:** 0\n    *   **Device:** 'cuda'\n    *   **Output File:** 'results.pt'\n    *   **Problem:** 'c2dtlz2' (default), choices include 'c2dtlz2', 'osy', 'ripple'\n    *   **Number of Batches (`n_batch`):** 50\n    *   **Monte Carlo Samples (`mc_samples`):** 128\n    *   **Batch Size:** 2\n    *   **Initial Data:** `2 * (d + 1)` points generated using 'rejection' sampling\n    *   **Models Evaluated:** `SingleTaskGP` (ind), `MatheronMultiTaskGP` (mmtgp), `KroneckerMultiTaskGP` (mtgp)\n    *   **Acquisition Functions:** `qExpectedHypervolumeImprovement` (`qehvi` variants) and `qExpectedImprovement` with Chebyshev scalarization (`qparego` variants). Both use `IIDNormalSampler`.\n    *   **Optimization:** `optimize_acqf` or `optimize_acqf_list` with `num_restarts=10`, `raw_samples=512`, `options={'batch_limit': 5, 'maxiter': 200, 'init_batch_limit': 20}`\n    *   **Model Fitting:** `fit_gpytorch_torch` with `maxiter=250`\n\n4.  **High-Order GP Composite Function Experiments (Files: `hogp_experiments/hogp_composite_function.py`, `hogp_experiments/hogp_optics.py`):**\n    *   **Seed:** 10\n    *   **Number of Trials (`n_trials`):** 1\n    *   **Number of Initial Points (`n_init`):** 5\n    *   **Number of Batches (`n_batches`):** 10\n    *   **Batch Size:** 3\n    *   **Number of Fantasies (`num_fantasies`):** 64\n    *   **Number of Restarts (`num_restarts`):** 16\n    *   **Monte Carlo Samples (`mc_samples`):** 256\n    *   **Raw Samples (`raw_samples`):** 512\n    *   **Partial Restarts (`partial_restarts`):** 12\n    *   **Batch Limit:** 4\n    *   **Initial Batch Limit:** 8\n    *   **Max Iterations (`maxiter`):** 200\n    *   **`s_size` (first dimension of output tensor):** 3\n    *   **`t_size` (second dimension of output tensor):** 4\n    *   **Device:** 'gpu' (mapped to 'cuda' or 'cpu')\n    *   **Problem:** 'environmental' (default in `hogp_composite_function.py`), 'optics' (in `hogp_experiments/hogp_optics.py`), other choices: 'precursor', 'maveric1', 'pde'\n    *   **Max Composite Function Batch Size (`max_cf_batch_size`):** 100\n    *   **Models Evaluated:** `FixedNoiseGP` (`ei`, `ei_cf`) and `HigherOrderGP` (`ei_hogp_cf`, `ei_hogp_cf_smooth`). Also random baselines (`rnd`, `rnd_cf`).\n    *   **`HigherOrderGP` Latent Initialization:** 'default' or 'gp' (for `ei_hogp_cf_smooth`, representing a Gaussian Process with Matern2.5 kernel for latent parameters).\n    *   **Outcome Transform for `HigherOrderGP`:** `FlattenedStandardize`\n    *   **Acquisition Function:** `qExpectedImprovement` with `IIDNormalSampler`\n    *   **Optimization:** `optimize_acqf` with specified `num_restarts`, `raw_samples`, and `options` for 'L-BFGS-B'\n    *   **Model Fitting:** `fit_gpytorch_model` or `fit_gpytorch_torch` (if output dims > 500) for `HigherOrderGP` with `maxiter=3000`."
+}
