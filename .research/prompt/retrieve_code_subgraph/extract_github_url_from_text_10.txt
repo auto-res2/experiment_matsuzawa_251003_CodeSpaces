@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology involves a Bayesian Optimization (BO) framework that models the joint space of input hyperparameters and training iterations using a Gaussian Process (GP) surrogate. A novel aspect is the compression of the entire learning curve into a single numeric score using a Sigmoid (Logistic) preference function, whose parameters are learned directly from the data by maximizing the GP log marginal likelihood. To enhance sample-efficiency and prevent GP covariance matrix ill-conditioning, a data augmentation technique is introduced: points are selectively sampled from intermediate training steps (at maximum GP predictive uncertainty) until the natural log of the covariance matrix condition number exceeds a predefined threshold. The algorithm uses a cost-sensitive acquisition function, specifically a modified Expected Improvement (EI) criterion, which balances high function value, high uncertainty, and low computational cost, with the training time cost approximated by a linear regressor.
+
+# GitHub URLs List
+['https://github.com/ntienvu/BOIL']
+Output:
+{
+    "index": 0
+}
