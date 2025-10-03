@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The methodology introduces IGNITE, a model-agnostic regularization approach for offline optimization. It defines generalized surrogate sharpness, RX(ω), as the maximum output change of the surrogate model under low-energy parameter perturbation. To make this tractable, RX(ω) is approximated by its empirical estimate RD(ω), which is further simplified to a function of the surrogate's gradient norm, ρ · ||∇ωh(ω)||. The surrogate training objective is then augmented into a constrained optimization problem (min LD(ω) s.t. ρ · ||∇ωh(ω)|| ≤ ϵ). This constrained problem is solved using the Basic Differential Multiplier Method (BDMM) for IGNITE, which simultaneously performs gradient ascent for the Lagrange multiplier λ and gradient descent for the surrogate parameters ω. To avoid expensive Hessian computations required for differentiating the gradient norm, a Hessian-vector product approximation technique is employed. An alternative method, IGNITE-2, treats λ as a fixed hyper-parameter and optimizes ω using gradient descent.
+
+# GitHub URLs List
+['https://github.com/cuong-dm/IGNITE']
+Output:
+{
+    "index": 0
+}
