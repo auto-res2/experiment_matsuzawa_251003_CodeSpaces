@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+CPL reformulates the classical homotopy optimization problem into a single-loop model training problem. A learnable model, xϕ(t) (implemented as a neural network), is built to approximate the continuous continuation path x∗(t), mapping any homotopy level t to its corresponding solution. The model is trained by minimizing the expectation Et[H(xϕ(t), t)] using stochastic gradient descent (SGD) with Monte Carlo sampling. Gradients are computed via the chain rule, leveraging backpropagation for the path model's Jacobian. For homotopy functions with unknown or hard-to-compute gradients, zeroth-order optimization methods like an Evolutionary Strategy (ES) approximation are employed. For Gaussian homotopy, a specific approximation using evaluations of the original function f(x) is used. An optional local search step can be applied after training, using the learned path model's output as a warm start for specific homotopy levels (e.g., t=1 for the original problem). For neural combinatorial optimization, CPL conditions parts of the Attention Model's decoder parameters (WQ(t), WProj(t)) on the continuation level 't' using an MLP/hypernetwork, and trains the policy model using REINFORCE with POMO rollout.
+
+# GitHub URLs List
+['https://github.com/yd-kwon/POMO']
+Output:
+{
+    "index": 0
+}
