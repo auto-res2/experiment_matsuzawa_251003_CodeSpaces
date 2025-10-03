@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+CPL constructs a learnable model, typically a neural network xϕ(t), that maps any continuation level t to its corresponding solution. The model parameters ϕ are optimized by minimizing the expected homotopy function EtH(xϕ(t), t) using stochastic gradient descent. Gradients are computed via the chain rule (∇ϕH = ∂xϕ(t)/∂ϕ · ∇xH). For cases where ∇xH is unknown or hard to compute, zeroth-order optimization methods like Evolutionary Strategy (ES) or Gaussian smoothing approximations are used. An optional local search can be applied to the learned solution xϕ(t) to further refine it. For Neural Combinatorial Optimization, the Attention Model's decoder parameters are made dynamic, conditioned on the continuation level t via an MLP, and trained using REINFORCE with POMO rollout.
+
+# GitHub URLs List
+['https://github.com/yd-kwon/POMO']
+Output:
+{
+    "index": 0
+}
