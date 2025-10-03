@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology involves adapting Matheron's rule for posterior sampling in Gaussian Processes (GPs) to multi-task and high-order GPs by exploiting Kronecker structure. Matheron's rule allows for sampling from the posterior distribution by drawing joint samples from the prior over both training and test points, and then updating these samples using observed data. For Multi-task GPs (MTGPs) with Kronecker-structured covariances, the joint covariance matrix is factorized as a Kronecker product, enabling efficient root decompositions and matrix-vector multiplications that are additive in `n` and `t`. This approach is extended to High-Order Gaussian Process (HOGP) models by replacing the task kernel with a chain of Kronecker products representing tensor dimensions. For HOGP models, the paper also proposes a new set of priors for latent parameters, initializing them from a Gaussian process with a Matern2.5 kernel to encourage smoothly varying latent dimensions, leading to more smoothly varying posterior variances. The efficient posterior sampling is crucial for Monte Carlo acquisition functions used in various BO settings.
+
+# GitHub URLs List
+['https://github.com/wjmaddox/mtgp_sampler', 'https://github.com/msu-coinlab/pymoo']
+Output:
+{
+    "index": 0
+}
