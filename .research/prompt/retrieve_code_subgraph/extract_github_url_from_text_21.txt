@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+FEDHPO-B is designed as a benchmark suite upon the FederatedScope (FS) platform, providing a unified interface for HPO methods. It supports three modes for function evaluation: 'tabular' mode uses pre-computed lookup tables from grid search executions, storing averaged results across multiple random seeds for efficiency. The 'surrogate' mode employs Random Forest models trained on the tabular data to enable efficient evaluation of arbitrary, non-grid configurations. The 'raw' mode allows direct execution of FL algorithms in containerized environments for user-defined search spaces. For the raw mode, a novel configurable system model is implemented to estimate realistic execution time, accounting for server bottlenecks and client computational heterogeneity (modeled by an exponential distribution). The benchmark design considers a general algorithmic view for FedHPO methods to facilitate integration and extensibility for both traditional and novel FL-specific HPO techniques.
+
+# GitHub URLs List
+['https://github.com/alibaba/FederatedScope', 'https://github.com/automl/DEHB']
+Output:
+{
+    "index": 0
+}
