@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology involves FedEx, which adapts the weight-sharing paradigm from Neural Architecture Search (NAS) to tune local Federated Learning (FL) hyperparameters. It formalizes FL algorithm decomposition into local training (Locc) and aggregation (Aggb) subroutines. FedEx replaces the personalized FL objective with a single-level empirical risk minimization, treating hyperparameters as architectural parameters. It uses a stochastic relaxation where local hyperparameters are sampled from a 'theta'-parameterized categorical distribution over k configurations (randomly sampled, often with local perturbation). The algorithm alternates between standard SGD updates for shared model weights (Aggb results) and exponentiated gradient updates for the distribution parameters 'theta' based on aggregated local validation losses. This enables simultaneous model training and hyperparameter tuning. FedEx is designed to be wrapped by standard hyperparameter optimization algorithms like Random Search (RS) or Successive Halving (SHA) to tune server hyperparameters and FedEx's own parameters. Theoretically, a FedEx variant for tuning client step-size is analyzed within the Average Regret-Upper-Bound Analysis (ARUBA) framework for online convex optimization.
+
+# GitHub URLs List
+['https://github.com/mkhodak/fedex', 'https://github.com/TalwalkarLab/leaf']
+Output:
+{
+    "index": 0
+}
